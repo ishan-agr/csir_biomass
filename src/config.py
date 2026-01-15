@@ -121,6 +121,48 @@ class GPUConfig:
 
 
 @dataclass
+class GradientBalancingConfig:
+    """Gradient balancing configuration for multi-task learning."""
+    # Method: equal, competition, uncertainty, mgda, gradnorm, pcgrad, cagrad, dwa
+    method: str = "mgda"
+
+    # MGDA settings
+    mgda_normalize: bool = True  # Normalize gradients before solving
+    mgda_use_rep_grad: bool = True  # Use representation gradients (more efficient)
+
+    # GradNorm settings
+    gradnorm_alpha: float = 1.5  # Asymmetry parameter (higher = focus on lagging tasks)
+    gradnorm_weight_lr: float = 0.025  # Learning rate for weight updates
+
+    # PCGrad settings
+    pcgrad_reduction: str = "mean"  # 'mean' or 'sum'
+
+    # CAGrad settings
+    cagrad_c: float = 0.5  # Trade-off parameter (0=average, 1=conflict-averse)
+    cagrad_rescale: bool = True
+
+    # DWA settings
+    dwa_temperature: float = 2.0  # Higher = more uniform weights
+
+
+@dataclass
+class MLflowConfig:
+    """MLflow experiment tracking configuration."""
+    enabled: bool = True
+    experiment_name: str = "csiro_biomass"
+    tracking_uri: str = "file:./mlruns"  # Local tracking, or use remote URI
+    run_name: Optional[str] = None  # Auto-generated if None
+    log_system_metrics: bool = True
+    log_gpu_metrics: bool = True
+    log_model: bool = True  # Log final model to MLflow
+    log_checkpoints: bool = False  # Log all checkpoints (can be large)
+    artifact_location: Optional[str] = None
+
+    # Tags to add to all runs
+    tags: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class TrainingConfig:
     """Training configuration."""
     # General
@@ -152,7 +194,7 @@ class TrainingConfig:
     # Target transformation
     use_log_transform: bool = True  # log1p(target) for training
 
-    # Loss weighting strategy
+    # Loss weighting strategy (legacy - use gradient_balancing.method instead)
     loss_weighting: str = "competition"  # Options: equal, competition, uncertainty
 
     # Cross-validation
@@ -230,6 +272,8 @@ class Config:
     augmentation: AugmentationConfig = field(default_factory=AugmentationConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
     gpu: GPUConfig = field(default_factory=GPUConfig)
+    gradient_balancing: GradientBalancingConfig = field(default_factory=GradientBalancingConfig)
+    mlflow: MLflowConfig = field(default_factory=MLflowConfig)
 
     def __post_init__(self):
         """Create directories and validate config."""

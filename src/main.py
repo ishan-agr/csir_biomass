@@ -2,17 +2,23 @@
 Main Entry Point for CSIRO Pasture Biomass Prediction.
 
 Usage:
-    # Train single fold
+    # Train single fold with basic loss weighting
     python main.py train --fold 0
 
-    # Train all folds (cross-validation)
-    python main.py train --cv
+    # Train with advanced gradient balancing (MGDA)
+    python main.py train --fold 0 --gradient_method mgda
+
+    # Train all folds (cross-validation) with GradNorm
+    python main.py train --cv --gradient_method gradnorm
 
     # Generate submission
     python main.py predict --output submission.csv
 
     # Full pipeline (train + predict)
     python main.py full --cv --output submission.csv
+
+    # View MLflow experiments
+    mlflow ui --port 5000
 
 Architecture & Approach:
 -----------------------
@@ -34,22 +40,31 @@ This solution uses Multi-Task Learning (MTL) with Hard Parameter Sharing:
      * GDM_g = Dry_Green_g + Dry_Clover_g
      * Dry_Total_g = Dry_Green_g + Dry_Dead_g + Dry_Clover_g
 
-4. TRAINING STRATEGY:
+4. GRADIENT BALANCING METHODS:
+   - MGDA: Multi-Objective Gradient Descent (Pareto optimization)
+   - GradNorm: Adaptive gradient normalization
+   - PCGrad: Projecting Conflicting Gradients
+   - CAGrad: Conflict-Averse Gradient Descent
+   - DWA: Dynamic Weight Averaging
+
+5. TRAINING STRATEGY:
    - Log1p transform for right-skewed targets
-   - Competition-aware loss weighting
    - Cosine annealing with warmup
    - Mixed precision training
-   - Gradient accumulation
+   - MLflow experiment tracking
 
-5. INFERENCE:
+6. INFERENCE:
    - Test-Time Augmentation (TTA)
    - Fold ensemble
 
 Key References:
 - Multi-Task Learning: https://hav4ik.github.io/articles/mtl-a-practical-survey
+- MGDA: https://arxiv.org/abs/1810.04650
+- GradNorm: https://arxiv.org/abs/1711.02257
+- PCGrad: https://arxiv.org/abs/2001.06782
+- BioMassters 1st Place: https://github.com/drivendataorg/the-biomassters
 - ConvNeXt: https://arxiv.org/abs/2201.03545
 - timm library: https://github.com/huggingface/pytorch-image-models
-- Uncertainty Weighting: https://arxiv.org/abs/1705.07115
 """
 
 import argparse
@@ -62,6 +77,15 @@ sys.path.insert(0, str(Path(__file__).parent))
 from config import get_config, PRETRAINED_MODELS
 from train import train_fold, train_cv
 from inference import generate_submission, ensemble_from_folds
+
+# Try to import advanced training (with gradient balancing and MLflow)
+try:
+    from train_advanced import train_fold_advanced, train_cv_advanced
+    ADVANCED_TRAINING_AVAILABLE = True
+except ImportError:
+    ADVANCED_TRAINING_AVAILABLE = False
+
+GRADIENT_METHODS = ['equal', 'competition', 'uncertainty', 'mgda', 'gradnorm', 'pcgrad', 'cagrad', 'dwa']
 
 
 def main():
@@ -105,6 +129,17 @@ Examples:
                               help='Random seed')
     train_parser.add_argument('--compile', action='store_true',
                               help='Use torch.compile for faster training (Linux only, requires Triton)')
+    # Advanced gradient balancing options
+    train_parser.add_argument('--gradient_method', type=str, default='competition',
+                              choices=GRADIENT_METHODS,
+                              help='Gradient balancing method (mgda, gradnorm, pcgrad, cagrad, dwa)')
+    train_parser.add_argument('--gradnorm_alpha', type=float, default=1.5,
+                              help='GradNorm alpha parameter (asymmetry)')
+    # MLflow options
+    train_parser.add_argument('--no_mlflow', action='store_true',
+                              help='Disable MLflow tracking')
+    train_parser.add_argument('--experiment_name', type=str, default='csiro_biomass',
+                              help='MLflow experiment name')
 
     # Predict command
     predict_parser = subparsers.add_parser('predict', help='Generate predictions')
@@ -135,6 +170,28 @@ Examples:
     info_parser = subparsers.add_parser('info', help='Show model info')
     info_parser.add_argument('--backbone', type=str, default='convnext_base')
 
+    # MLflow experiment commands
+    mlflow_parser = subparsers.add_parser('mlflow', help='MLflow experiment management')
+    mlflow_subparsers = mlflow_parser.add_subparsers(dest='mlflow_command')
+
+    # mlflow compare
+    compare_parser = mlflow_subparsers.add_parser('compare', help='Compare experiments')
+    compare_parser.add_argument('--experiment', type=str, default='csiro_biomass',
+                                help='Experiment name')
+    compare_parser.add_argument('--top_n', type=int, default=10,
+                                help='Show top N runs')
+    compare_parser.add_argument('--metric', type=str, default='val/weighted_r2',
+                                help='Metric to sort by')
+
+    # mlflow export
+    export_parser = mlflow_subparsers.add_parser('export', help='Export experiment results')
+    export_parser.add_argument('--experiment', type=str, default='csiro_biomass')
+    export_parser.add_argument('--output', type=str, default='experiment_results.json')
+
+    # mlflow ui
+    ui_parser = mlflow_subparsers.add_parser('ui', help='Launch MLflow UI')
+    ui_parser.add_argument('--port', type=int, default=5000)
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -150,14 +207,49 @@ Examples:
 
         compile_flag = getattr(args, 'compile', False)
 
-        if args.cv:
-            result = train_cv(config, compile_model_flag=compile_flag)
-            print(f"\nCV Results: {result['mean_r2']:.4f} ± {result['std_r2']:.4f}")
-        elif args.fold is not None:
-            result = train_fold(config, args.fold, compile_model_flag=compile_flag)
-            print(f"\nFold {args.fold} Best R²: {result['best_score']:.4f}")
+        # Configure gradient balancing
+        gradient_method = getattr(args, 'gradient_method', 'competition')
+        config.gradient_balancing.method = gradient_method
+        if hasattr(args, 'gradnorm_alpha'):
+            config.gradient_balancing.gradnorm_alpha = args.gradnorm_alpha
+
+        # Configure MLflow
+        config.mlflow.enabled = not getattr(args, 'no_mlflow', False)
+        if hasattr(args, 'experiment_name'):
+            config.mlflow.experiment_name = args.experiment_name
+
+        # Use advanced training for gradient balancing methods
+        use_advanced = gradient_method in ['mgda', 'gradnorm', 'pcgrad', 'cagrad', 'dwa']
+
+        if use_advanced and ADVANCED_TRAINING_AVAILABLE:
+            print(f"Using advanced training with {gradient_method} gradient balancing")
+            if args.cv:
+                result = train_cv_advanced(config, compile_model_flag=compile_flag)
+                print(f"\nCV Results: {result['mean_r2']:.4f} ± {result['std_r2']:.4f}")
+            elif args.fold is not None:
+                result = train_fold_advanced(config, args.fold, compile_model_flag=compile_flag)
+                print(f"\nFold {args.fold} Best R²: {result['best_score']:.4f}")
+            else:
+                print("Please specify --fold or --cv")
+        elif use_advanced and not ADVANCED_TRAINING_AVAILABLE:
+            print(f"Warning: Advanced training not available, using basic training")
+            if args.cv:
+                result = train_cv(config, compile_model_flag=compile_flag)
+                print(f"\nCV Results: {result['mean_r2']:.4f} ± {result['std_r2']:.4f}")
+            elif args.fold is not None:
+                result = train_fold(config, args.fold, compile_model_flag=compile_flag)
+                print(f"\nFold {args.fold} Best R²: {result['best_score']:.4f}")
+            else:
+                print("Please specify --fold or --cv")
         else:
-            print("Please specify --fold or --cv")
+            if args.cv:
+                result = train_cv(config, compile_model_flag=compile_flag)
+                print(f"\nCV Results: {result['mean_r2']:.4f} ± {result['std_r2']:.4f}")
+            elif args.fold is not None:
+                result = train_fold(config, args.fold, compile_model_flag=compile_flag)
+                print(f"\nFold {args.fold} Best R²: {result['best_score']:.4f}")
+            else:
+                print("Please specify --fold or --cv")
 
     elif args.command == 'predict':
         config = get_config(args.backbone)
@@ -237,7 +329,58 @@ Examples:
         print(f"Trainable parameters: {count_parameters(model, trainable_only=True):,}")
         print(f"\nPretrained weights: {PRETRAINED_MODELS[args.backbone]['weights']}")
         print(f"Notes: {PRETRAINED_MODELS[args.backbone]['notes']}")
+        print(f"\nGradient balancing methods available:")
+        for method in GRADIENT_METHODS:
+            print(f"  - {method}")
         print(f"{'='*50}")
+
+    elif args.command == 'mlflow':
+        try:
+            from mlflow_tracking import ExperimentManager
+            import subprocess
+        except ImportError:
+            print("MLflow not installed. Install with: pip install mlflow")
+            return
+
+        if args.mlflow_command == 'compare':
+            manager = ExperimentManager()
+            runs = manager.get_experiment_runs(
+                args.experiment,
+                order_by=[f"metrics.{args.metric} DESC"],
+                max_results=args.top_n
+            )
+
+            if not runs:
+                print(f"No runs found in experiment: {args.experiment}")
+                return
+
+            print(f"\n{'='*80}")
+            print(f"Top {len(runs)} runs in '{args.experiment}' (sorted by {args.metric})")
+            print(f"{'='*80}")
+            print(f"{'Run Name':<40} {'R²':>10} {'Backbone':>20} {'Method':>15}")
+            print("-" * 80)
+
+            for run in runs:
+                run_name = run.info.run_name or run.info.run_id[:8]
+                r2 = run.data.metrics.get(args.metric, 0)
+                backbone = run.data.tags.get('backbone', 'N/A')
+                method = run.data.tags.get('gradient_method', 'N/A')
+                print(f"{run_name:<40} {r2:>10.4f} {backbone:>20} {method:>15}")
+
+            print(f"{'='*80}\n")
+
+        elif args.mlflow_command == 'export':
+            manager = ExperimentManager()
+            manager.export_run_summary(args.experiment, args.output)
+            print(f"Exported to {args.output}")
+
+        elif args.mlflow_command == 'ui':
+            print(f"Starting MLflow UI on port {args.port}...")
+            print(f"Open http://localhost:{args.port} in your browser")
+            subprocess.run(['mlflow', 'ui', '--port', str(args.port)])
+
+        else:
+            print("Please specify a mlflow subcommand: compare, export, or ui")
 
 
 if __name__ == "__main__":
