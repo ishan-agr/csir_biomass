@@ -6,6 +6,14 @@ Implements state-of-the-art gradient balancing strategies:
 2. GradNorm - Chen et al., ICML 2018
 3. PCGrad (Projecting Conflicting Gradients) - Yu et al., NeurIPS 2020
 
+IMPORTANT: This implements the ACTUAL algorithms as described in:
+- MTL Survey: https://hav4ik.github.io/articles/mtl-a-practical-survey
+- MGDA Paper: https://arxiv.org/abs/1810.04650
+
+Key insight from survey:
+"For each task t, compute gradients ∇_{θ^sh} L^t, then solve:
+ minimize ||Σ λ^t ∇_{θ^sh} L^t||² s.t. Σλ^t=1, λ^t≥0"
+
 References:
 - MGDA: https://arxiv.org/abs/1810.04650
 - GradNorm: https://arxiv.org/abs/1711.02257
@@ -21,37 +29,11 @@ from abc import ABC, abstractmethod
 import copy
 
 
-class GradientBalancer(ABC):
-    """Base class for gradient balancing methods."""
-
-    @abstractmethod
-    def balance(
-        self,
-        losses: List[torch.Tensor],
-        shared_params: List[torch.Tensor],
-        **kwargs
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """
-        Balance gradients from multiple task losses.
-
-        Args:
-            losses: List of task losses
-            shared_params: List of shared parameters to compute gradients for
-
-        Returns:
-            combined_loss: Weighted combination of losses
-            info: Dictionary with balancing information
-        """
-        pass
-
-
-class MGDASolver:
+class MinNormSolver:
     """
-    Minimum-norm solver for MGDA using Frank-Wolfe algorithm.
+    Solver for finding minimum-norm point in convex hull.
 
-    Finds the minimum-norm point in the convex hull of task gradients,
-    which represents the optimal descent direction for all tasks.
-
+    Implements Frank-Wolfe algorithm for MGDA optimization.
     Reference: https://github.com/isl-org/MultiObjectiveOptimization
     """
 
@@ -61,362 +43,409 @@ class MGDASolver:
     @staticmethod
     def _min_norm_element_from2(v1v1: float, v1v2: float, v2v2: float) -> Tuple[float, float]:
         """
-        Analytical solution for min-norm point in 2D case.
-
-        Find min_{c} || c*v1 + (1-c)*v2 ||^2
+        Analytical solution for 2D case.
+        Find γ that minimizes ||γ*v1 + (1-γ)*v2||²
         """
         if v1v2 >= v1v1:
-            # Optimal is v1
             return 1.0, v1v1
         if v1v2 >= v2v2:
-            # Optimal is v2
             return 0.0, v2v2
 
-        # Optimal is in between
         gamma = (v2v2 - v1v2) / (v1v1 + v2v2 - 2 * v1v2 + 1e-8)
         gamma = max(0.0, min(1.0, gamma))
         cost = gamma * gamma * v1v1 + 2 * gamma * (1 - gamma) * v1v2 + (1 - gamma) * (1 - gamma) * v2v2
         return gamma, cost
 
     @staticmethod
-    def _min_norm_2d(grad_mat: np.ndarray) -> Tuple[np.ndarray, float]:
+    def find_min_norm_element(grads: List[torch.Tensor]) -> Tuple[torch.Tensor, float]:
         """
-        Find minimum norm solution for 2 tasks.
+        Find minimum norm element in convex hull of gradients using Frank-Wolfe.
 
         Args:
-            grad_mat: (2, d) matrix of gradients
+            grads: List of flattened gradient tensors (one per task)
 
         Returns:
-            sol: Optimal weights [w1, w2]
-            nd: Minimum norm value
-        """
-        v1v1 = np.dot(grad_mat[0], grad_mat[0])
-        v1v2 = np.dot(grad_mat[0], grad_mat[1])
-        v2v2 = np.dot(grad_mat[1], grad_mat[1])
-
-        gamma, cost = MGDASolver._min_norm_element_from2(v1v1, v1v2, v2v2)
-        return np.array([gamma, 1 - gamma]), cost
-
-    @staticmethod
-    def _projection_simplex_sort(v: np.ndarray) -> np.ndarray:
-        """Project vector onto probability simplex."""
-        n = len(v)
-        if n == 0:
-            return v
-
-        u = np.sort(v)[::-1]
-        cssv = np.cumsum(u)
-        rho = np.nonzero(u * np.arange(1, n + 1) > (cssv - 1))[0]
-
-        if len(rho) == 0:
-            return np.ones(n) / n
-
-        rho = rho[-1]
-        theta = (cssv[rho] - 1) / (rho + 1.0)
-        return np.maximum(v - theta, 0)
-
-    @staticmethod
-    def find_min_norm_element(grads: List[np.ndarray], normalize: bool = True) -> Tuple[np.ndarray, float]:
-        """
-        Find minimum norm element in convex hull using Frank-Wolfe.
-
-        Args:
-            grads: List of gradient vectors (one per task)
-            normalize: Whether to normalize gradients before solving
-
-        Returns:
-            sol: Optimal task weights
+            weights: Optimal task weights (tensor on same device)
             min_norm: Minimum norm value
         """
         n_tasks = len(grads)
+        device = grads[0].device
 
         if n_tasks == 1:
-            return np.array([1.0]), np.linalg.norm(grads[0])
+            return torch.ones(1, device=device), grads[0].norm().item()
 
-        # Stack gradients
-        grad_mat = np.stack(grads, axis=0)  # (n_tasks, d)
+        # Stack gradients: (n_tasks, d)
+        grad_mat = torch.stack(grads)
 
-        # Normalize if requested
-        if normalize:
-            norms = np.linalg.norm(grad_mat, axis=1, keepdims=True)
-            norms = np.maximum(norms, 1e-8)
-            grad_mat = grad_mat / norms
+        # Compute Gram matrix: G[i,j] = <grad_i, grad_j>
+        gram = torch.mm(grad_mat, grad_mat.t())  # (n_tasks, n_tasks)
 
-        # Special case: 2 tasks - use analytical solution
+        # Special case: 2 tasks - analytical solution
         if n_tasks == 2:
-            return MGDASolver._min_norm_2d(grad_mat)
+            v1v1 = gram[0, 0].item()
+            v1v2 = gram[0, 1].item()
+            v2v2 = gram[1, 1].item()
+            gamma, _ = MinNormSolver._min_norm_element_from2(v1v1, v1v2, v2v2)
+            weights = torch.tensor([gamma, 1 - gamma], device=device)
+            min_norm = torch.sqrt(weights @ gram @ weights).item()
+            return weights, min_norm
 
         # General case: Frank-Wolfe algorithm
-        # Precompute Gram matrix
-        gram = grad_mat @ grad_mat.T  # (n_tasks, n_tasks)
-
         # Initialize with equal weights
-        sol = np.ones(n_tasks) / n_tasks
+        sol = torch.ones(n_tasks, device=device) / n_tasks
 
-        for _ in range(MGDASolver.MAX_ITER):
-            # Compute gradient of objective: 2 * G @ sol
-            grad_obj = gram @ sol
+        for _ in range(MinNormSolver.MAX_ITER):
+            # Gradient of objective: 2 * G @ sol
+            grad_obj = torch.mv(gram, sol)
 
-            # Find minimizing vertex (min over simplex vertices)
-            min_idx = np.argmin(grad_obj)
+            # Find minimizing vertex (argmin over simplex vertices)
+            min_idx = grad_obj.argmin()
 
-            # Compute descent direction
-            descent = np.zeros(n_tasks)
+            # Descent direction
+            descent = torch.zeros(n_tasks, device=device)
             descent[min_idx] = 1.0
-            descent -= sol
+            descent = descent - sol
 
-            # Line search
-            # min_gamma || sol + gamma * descent ||^2_G
-            # = ||sol||^2_G + 2*gamma*<sol, descent>_G + gamma^2*||descent||^2_G
-            a = descent @ gram @ descent
-            b = 2 * sol @ gram @ descent
+            # Line search: min_{γ} ||sol + γ*descent||²_G
+            a = (descent @ gram @ descent).item()
+            b = 2 * (sol @ gram @ descent).item()
 
             if a <= 1e-8:
                 gamma = 1.0
             else:
                 gamma = max(0.0, min(1.0, -b / (2 * a + 1e-8)))
 
-            # Check convergence
-            if gamma < MGDASolver.STOP_CRIT:
+            # Convergence check
+            if gamma < MinNormSolver.STOP_CRIT:
                 break
 
             # Update
             sol = sol + gamma * descent
 
         # Ensure valid probability distribution
-        sol = np.maximum(sol, 0)
+        sol = torch.clamp(sol, min=0)
         sol = sol / (sol.sum() + 1e-8)
 
         # Compute minimum norm
-        min_norm = np.sqrt(max(0, sol @ gram @ sol))
+        min_norm = torch.sqrt(torch.clamp(sol @ gram @ sol, min=0)).item()
 
         return sol, min_norm
 
 
-class MGDA(GradientBalancer):
+class MGDAOptimizer:
     """
-    Multiple Gradient Descent Algorithm (MGDA).
+    MGDA Optimizer - Proper implementation following the survey.
 
-    Finds the minimum-norm point in the convex hull of task gradients,
-    guaranteeing descent for all tasks (Pareto improvement).
+    Algorithm (from https://hav4ik.github.io/articles/mtl-a-practical-survey):
+    1. For each task t: compute ∇_{θ^sh} L^t (requires T backward passes)
+    2. Solve: min ||Σ λ^t ∇L^t||² s.t. Σλ^t=1, λ^t≥0
+    3. Apply: θ^sh ← θ^sh - η * Σ λ^t ∇L^t
 
-    Reference: Sener & Koltun, "Multi-Task Learning as Multi-Objective Optimization", NeurIPS 2018
-    https://arxiv.org/abs/1810.04650
+    This guarantees Pareto improvement at each step.
     """
 
     def __init__(
         self,
-        normalize_grads: bool = True,
-        use_rep_grad: bool = True,
-        max_norm: float = 1.0
+        shared_params: List[nn.Parameter],
+        task_specific_params: Optional[List[List[nn.Parameter]]] = None,
+        normalize_grads: bool = True
     ):
         """
         Args:
-            normalize_grads: Normalize task gradients before solving
-            use_rep_grad: Use representation gradients (more efficient)
-            max_norm: Maximum gradient norm for clipping
+            shared_params: List of shared parameters (backbone, fusion)
+            task_specific_params: Optional list of task-specific param lists
+            normalize_grads: Whether to normalize gradients before solving
         """
+        self.shared_params = list(shared_params)
+        self.task_specific_params = task_specific_params or []
         self.normalize_grads = normalize_grads
-        self.use_rep_grad = use_rep_grad
-        self.max_norm = max_norm
 
-    def balance(
+        # Track gradient shapes for reconstruction
+        self._grad_shapes = [p.shape for p in self.shared_params]
+        self._grad_numel = [p.numel() for p in self.shared_params]
+
+    def _flatten_grads(self, grads: List[torch.Tensor]) -> torch.Tensor:
+        """Flatten list of gradients into single vector."""
+        return torch.cat([g.flatten() for g in grads])
+
+    def _unflatten_grads(self, flat_grad: torch.Tensor) -> List[torch.Tensor]:
+        """Unflatten gradient vector back to parameter shapes."""
+        grads = []
+        idx = 0
+        for shape, numel in zip(self._grad_shapes, self._grad_numel):
+            grads.append(flat_grad[idx:idx + numel].view(shape))
+            idx += numel
+        return grads
+
+    def compute_task_gradients(
         self,
-        losses: List[torch.Tensor],
-        shared_params: List[torch.Tensor],
-        representations: Optional[torch.Tensor] = None,
-        **kwargs
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        task_losses: List[torch.Tensor],
+        retain_graph: bool = True
+    ) -> List[torch.Tensor]:
         """
-        Compute MGDA-weighted loss.
+        Compute gradients for each task w.r.t. shared parameters.
+
+        This is the key step: T backward passes to get T gradient vectors.
 
         Args:
-            losses: List of task losses
-            shared_params: Shared parameters (used if representations is None)
-            representations: Shared representations (more efficient)
+            task_losses: List of scalar loss tensors (one per task)
+            retain_graph: Whether to retain computation graph
 
         Returns:
-            weighted_loss: MGDA-weighted combination of losses
-            info: Dictionary with task weights and min-norm value
+            List of flattened gradient tensors
         """
-        n_tasks = len(losses)
-        device = losses[0].device
+        task_grads = []
 
-        # Compute task gradients
-        grads = []
+        for i, loss in enumerate(task_losses):
+            # Compute gradient for this task
+            grads = torch.autograd.grad(
+                loss,
+                self.shared_params,
+                retain_graph=retain_graph,
+                create_graph=False,
+                allow_unused=True
+            )
 
-        if representations is not None and self.use_rep_grad:
-            # Use representation gradients (more efficient)
-            for loss in losses:
-                grad = torch.autograd.grad(
-                    loss, representations,
-                    retain_graph=True,
-                    create_graph=False
-                )[0]
-                grads.append(grad.detach().flatten().cpu().numpy())
-        else:
-            # Use parameter gradients
-            for loss in losses:
-                grad_list = torch.autograd.grad(
-                    loss, shared_params,
-                    retain_graph=True,
-                    create_graph=False
-                )
-                grad = torch.cat([g.detach().flatten() for g in grad_list])
-                grads.append(grad.cpu().numpy())
+            # Handle None gradients (unused parameters)
+            grads = [g if g is not None else torch.zeros_like(p)
+                     for g, p in zip(grads, self.shared_params)]
 
-        # Solve min-norm problem
-        weights, min_norm = MGDASolver.find_min_norm_element(
-            grads, normalize=self.normalize_grads
-        )
+            # Flatten to single vector
+            flat_grad = self._flatten_grads(grads)
 
-        # Compute weighted loss
-        weights_tensor = torch.tensor(weights, dtype=torch.float32, device=device)
-        weighted_loss = sum(w * l for w, l in zip(weights_tensor, losses))
+            # Optionally normalize
+            if self.normalize_grads:
+                grad_norm = flat_grad.norm()
+                if grad_norm > 1e-8:
+                    flat_grad = flat_grad / grad_norm
+
+            task_grads.append(flat_grad)
+
+        return task_grads
+
+    def solve_mgda(
+        self,
+        task_grads: List[torch.Tensor]
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Solve MGDA optimization problem using Frank-Wolfe.
+
+        Args:
+            task_grads: List of flattened gradient tensors
+
+        Returns:
+            weights: Optimal task weights
+            info: Dictionary with solver information
+        """
+        weights, min_norm = MinNormSolver.find_min_norm_element(task_grads)
 
         info = {
-            'min_norm': float(min_norm),
-            **{f'weight_task{i}': float(w) for i, w in enumerate(weights)}
+            'min_norm': min_norm,
+            **{f'weight_task{i}': float(weights[i]) for i in range(len(weights))}
         }
 
-        return weighted_loss, info
+        return weights, info
+
+    def get_weighted_grad(
+        self,
+        task_grads: List[torch.Tensor],
+        weights: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute weighted combination of task gradients.
+
+        Args:
+            task_grads: List of flattened gradient tensors
+            weights: Task weights from MGDA solver
+
+        Returns:
+            Weighted gradient vector
+        """
+        weighted_grad = sum(w * g for w, g in zip(weights, task_grads))
+        return weighted_grad
+
+    def apply_gradients(self, weighted_grad: torch.Tensor):
+        """
+        Apply weighted gradient to shared parameters.
+
+        Sets .grad attribute for each shared parameter.
+        """
+        grads = self._unflatten_grads(weighted_grad)
+
+        for param, grad in zip(self.shared_params, grads):
+            if param.grad is None:
+                param.grad = grad.clone()
+            else:
+                param.grad.copy_(grad)
+
+    def step(
+        self,
+        task_losses: List[torch.Tensor],
+        retain_graph: bool = True
+    ) -> Dict[str, float]:
+        """
+        Full MGDA step: compute gradients, solve, apply.
+
+        Args:
+            task_losses: List of task losses
+            retain_graph: Whether to retain graph after gradients
+
+        Returns:
+            info: Dictionary with MGDA information
+        """
+        # Step 1: Compute per-task gradients (T backward passes)
+        task_grads = self.compute_task_gradients(task_losses, retain_graph)
+
+        # Step 2: Solve MGDA optimization
+        weights, info = self.solve_mgda(task_grads)
+
+        # Step 3: Compute weighted gradient
+        weighted_grad = self.get_weighted_grad(task_grads, weights)
+
+        # Step 4: Apply to shared parameters
+        self.apply_gradients(weighted_grad)
+
+        return info
 
 
-class GradNorm(GradientBalancer):
+class GradNormOptimizer:
     """
-    GradNorm: Gradient Normalization for Adaptive Loss Balancing.
+    GradNorm Optimizer - Proper implementation following the paper.
 
-    Automatically balances training by normalizing gradient magnitudes
-    across tasks using learnable weights.
+    Algorithm (Chen et al., ICML 2018):
+    1. Compute gradient norms G_i = ||∇_{W} w_i * L_i||
+    2. Compute average: G_avg = mean(G_i)
+    3. Compute relative inverse training rate: r_i = L_i(t) / L_i(0)
+    4. Target: G_i^target = G_avg * (r_i / mean(r_i))^α
+    5. Update weights to match targets
 
-    Reference: Chen et al., "GradNorm: Gradient Normalization for Adaptive Loss Balancing", ICML 2018
-    https://arxiv.org/abs/1711.02257
+    Reference: https://arxiv.org/abs/1711.02257
     """
 
     def __init__(
         self,
         n_tasks: int,
+        shared_layer: nn.Module,
         alpha: float = 1.5,
-        initial_weights: Optional[List[float]] = None,
-        weight_lr: float = 0.025
+        lr: float = 0.025
     ):
         """
         Args:
             n_tasks: Number of tasks
-            alpha: Asymmetry parameter (higher = more focus on lagging tasks)
-            initial_weights: Initial task weights (default: equal)
-            weight_lr: Learning rate for weight updates
+            shared_layer: Last shared layer for gradient computation
+            alpha: Asymmetry parameter (higher = focus on lagging tasks)
+            lr: Learning rate for weight updates
         """
         self.n_tasks = n_tasks
+        self.shared_layer = shared_layer
         self.alpha = alpha
-        self.weight_lr = weight_lr
+        self.lr = lr
 
-        # Initialize task weights (log-space for stability)
-        if initial_weights is None:
-            initial_weights = [1.0] * n_tasks
-        self.log_weights = nn.Parameter(
-            torch.log(torch.tensor(initial_weights, dtype=torch.float32))
-        )
+        # Learnable task weights (in log space for stability)
+        self.log_weights = nn.Parameter(torch.zeros(n_tasks))
 
-        # Track initial losses for relative loss computation
+        # Track initial losses
         self.initial_losses: Optional[torch.Tensor] = None
         self.step_count = 0
 
-    def get_weights(self) -> torch.Tensor:
-        """Get current task weights (normalized)."""
-        weights = torch.exp(self.log_weights)
-        return weights / weights.sum() * self.n_tasks
+    @property
+    def weights(self) -> torch.Tensor:
+        """Get current normalized weights."""
+        w = torch.exp(self.log_weights)
+        return w / w.sum() * self.n_tasks
 
-    def balance(
+    def step(
         self,
-        losses: List[torch.Tensor],
-        shared_params: List[torch.Tensor],
-        last_shared_layer: Optional[nn.Module] = None,
-        **kwargs
+        task_losses: List[torch.Tensor],
+        retain_graph: bool = True
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        Compute GradNorm-weighted loss with gradient normalization.
+        Compute GradNorm-weighted loss and update weights.
 
         Args:
-            losses: List of task losses
-            shared_params: Shared parameters
-            last_shared_layer: Last shared layer for gradient computation
+            task_losses: List of task losses
+            retain_graph: Whether to retain graph
 
         Returns:
-            weighted_loss: GradNorm-weighted combination of losses
-            info: Dictionary with weights and gradient norms
+            weighted_loss: Weighted combination of losses
+            info: Dictionary with GradNorm information
         """
-        device = losses[0].device
-        losses_tensor = torch.stack(losses)
+        self.step_count += 1
+        device = task_losses[0].device
 
-        # Initialize/update initial losses
+        losses_tensor = torch.stack(task_losses)
+
+        # Initialize initial losses
         if self.initial_losses is None:
             self.initial_losses = losses_tensor.detach().clone()
 
         # Get current weights
-        weights = self.get_weights().to(device)
+        weights = self.weights.to(device)
 
         # Compute weighted losses
         weighted_losses = weights * losses_tensor
-        weighted_loss = weighted_losses.sum()
 
-        # Compute gradient norms for each task
-        if last_shared_layer is not None:
-            # Get parameters from last shared layer
-            layer_params = list(last_shared_layer.parameters())
-            if layer_params:
-                grad_norms = []
-                for i, loss in enumerate(losses):
-                    # Compute gradient w.r.t. last shared layer
-                    grads = torch.autograd.grad(
-                        weights[i] * loss, layer_params,
-                        retain_graph=True,
-                        create_graph=True
-                    )
-                    grad_norm = torch.norm(torch.cat([g.flatten() for g in grads]))
-                    grad_norms.append(grad_norm)
+        # Get shared layer parameters
+        shared_params = list(self.shared_layer.parameters())
 
-                grad_norms = torch.stack(grad_norms)
+        if shared_params:
+            # Compute gradient norms for each task
+            grad_norms = []
+            for i, loss in enumerate(task_losses):
+                grads = torch.autograd.grad(
+                    weights[i] * loss,
+                    shared_params,
+                    retain_graph=True,
+                    create_graph=True,
+                    allow_unused=True
+                )
+                grads = [g if g is not None else torch.zeros_like(p)
+                         for g, p in zip(grads, shared_params)]
+                grad_norm = torch.norm(torch.cat([g.flatten() for g in grads]))
+                grad_norms.append(grad_norm)
 
-                # Compute average gradient norm
-                avg_grad_norm = grad_norms.mean().detach()
+            grad_norms = torch.stack(grad_norms)
 
-                # Compute relative inverse training rates
-                with torch.no_grad():
-                    loss_ratios = losses_tensor / (self.initial_losses.to(device) + 1e-8)
-                    avg_loss_ratio = loss_ratios.mean()
-                    relative_rates = loss_ratios / (avg_loss_ratio + 1e-8)
+            # Average gradient norm
+            avg_grad_norm = grad_norms.mean().detach()
 
-                    # Target gradient norms
-                    target_grad_norms = avg_grad_norm * (relative_rates ** self.alpha)
+            # Relative inverse training rates
+            with torch.no_grad():
+                loss_ratios = losses_tensor.detach() / (self.initial_losses.to(device) + 1e-8)
+                avg_loss_ratio = loss_ratios.mean()
+                relative_rates = loss_ratios / (avg_loss_ratio + 1e-8)
 
-                # GradNorm loss (for weight update)
-                gradnorm_loss = torch.abs(grad_norms - target_grad_norms).sum()
+                # Target gradient norms
+                target_grad_norms = avg_grad_norm * (relative_rates ** self.alpha)
 
-                # Update weights
-                weight_grads = torch.autograd.grad(
-                    gradnorm_loss, self.log_weights,
-                    retain_graph=True
-                )[0]
+            # GradNorm loss for weight update
+            gradnorm_loss = torch.abs(grad_norms - target_grad_norms).sum()
 
-                with torch.no_grad():
-                    self.log_weights.data -= self.weight_lr * weight_grads
-                    # Renormalize
+            # Update weights
+            if self.log_weights.grad is not None:
+                self.log_weights.grad.zero_()
+
+            gradnorm_loss.backward(retain_graph=retain_graph)
+
+            with torch.no_grad():
+                if self.log_weights.grad is not None:
+                    self.log_weights.data -= self.lr * self.log_weights.grad
+                    # Renormalize to prevent drift
                     self.log_weights.data -= self.log_weights.data.mean()
 
-        self.step_count += 1
+        # Compute final weighted loss (without grad for weight update)
+        weighted_loss = (weights.detach() * losses_tensor).sum()
 
-        # Build info dict
         info = {
             'gradnorm_step': self.step_count,
             **{f'weight_task{i}': float(weights[i]) for i in range(self.n_tasks)},
-            **{f'loss_task{i}': float(losses[i]) for i in range(self.n_tasks)}
+            **{f'loss_task{i}': float(task_losses[i]) for i in range(self.n_tasks)}
         }
 
         return weighted_loss, info
 
     def state_dict(self) -> Dict:
-        """Get state for checkpointing."""
+        """Save state for checkpointing."""
         return {
             'log_weights': self.log_weights.data.clone(),
             'initial_losses': self.initial_losses.clone() if self.initial_losses is not None else None,
@@ -430,86 +459,69 @@ class GradNorm(GradientBalancer):
         self.step_count = state['step_count']
 
 
-class PCGrad(GradientBalancer):
+class PCGradOptimizer:
     """
-    PCGrad: Projecting Conflicting Gradients.
+    PCGrad Optimizer - Project Conflicting Gradients.
 
-    When task gradients conflict (negative cosine similarity),
-    projects each gradient onto the normal plane of conflicting gradients.
+    Algorithm (Yu et al., NeurIPS 2020):
+    1. For each task i, compute gradient g_i
+    2. For each pair (i,j): if g_i · g_j < 0 (conflict),
+       project g_i onto normal plane of g_j
+    3. Average projected gradients
 
-    Reference: Yu et al., "Gradient Surgery for Multi-Task Learning", NeurIPS 2020
-    https://arxiv.org/abs/2001.06782
+    Reference: https://arxiv.org/abs/2001.06782
     """
 
-    def __init__(self, reduction: str = 'mean'):
-        """
-        Args:
-            reduction: How to combine gradients ('mean' or 'sum')
-        """
-        self.reduction = reduction
+    def __init__(self, shared_params: List[nn.Parameter]):
+        self.shared_params = list(shared_params)
+        self._grad_shapes = [p.shape for p in self.shared_params]
+        self._grad_numel = [p.numel() for p in self.shared_params]
 
-    @staticmethod
-    def _project_conflicting(grad_i: torch.Tensor, grad_j: torch.Tensor) -> torch.Tensor:
-        """
-        Project grad_i onto normal plane of grad_j if they conflict.
+    def _flatten_grads(self, grads: List[torch.Tensor]) -> torch.Tensor:
+        return torch.cat([g.flatten() for g in grads])
 
-        Args:
-            grad_i: Gradient to project
-            grad_j: Reference gradient
+    def _unflatten_grads(self, flat_grad: torch.Tensor) -> List[torch.Tensor]:
+        grads = []
+        idx = 0
+        for shape, numel in zip(self._grad_shapes, self._grad_numel):
+            grads.append(flat_grad[idx:idx + numel].view(shape))
+            idx += numel
+        return grads
 
-        Returns:
-            Projected gradient
-        """
-        dot = torch.dot(grad_i.flatten(), grad_j.flatten())
-
-        if dot < 0:
-            # Gradients conflict - project
-            grad_j_norm_sq = torch.dot(grad_j.flatten(), grad_j.flatten())
-            if grad_j_norm_sq > 1e-8:
-                grad_i = grad_i - (dot / grad_j_norm_sq) * grad_j
-
-        return grad_i
-
-    def balance(
+    def step(
         self,
-        losses: List[torch.Tensor],
-        shared_params: List[torch.Tensor],
-        **kwargs
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        task_losses: List[torch.Tensor],
+        retain_graph: bool = True
+    ) -> Dict[str, float]:
         """
-        Compute PCGrad-modified gradients.
-
-        Note: PCGrad modifies gradients directly, so we return a dummy loss
-        and the caller should apply gradients manually.
+        Compute PCGrad update.
 
         Args:
-            losses: List of task losses
-            shared_params: Shared parameters
+            task_losses: List of task losses
 
         Returns:
-            combined_loss: Sum of losses (for logging)
             info: Dictionary with conflict information
         """
-        n_tasks = len(losses)
-        device = losses[0].device
+        n_tasks = len(task_losses)
 
-        # Compute gradients for each task
+        # Compute per-task gradients
         task_grads = []
-        for loss in losses:
+        for loss in task_losses:
             grads = torch.autograd.grad(
-                loss, shared_params,
-                retain_graph=True,
-                create_graph=False
+                loss,
+                self.shared_params,
+                retain_graph=retain_graph,
+                create_graph=False,
+                allow_unused=True
             )
-            # Flatten and concatenate
-            grad = torch.cat([g.detach().flatten() for g in grads])
-            task_grads.append(grad)
+            grads = [g if g is not None else torch.zeros_like(p)
+                     for g, p in zip(grads, self.shared_params)]
+            task_grads.append(self._flatten_grads(grads))
 
-        # Track conflicts
+        # Project conflicting gradients
         n_conflicts = 0
-
-        # Apply PCGrad - project conflicting gradients
         projected_grads = []
+
         for i in range(n_tasks):
             grad_i = task_grads[i].clone()
 
@@ -519,281 +531,160 @@ class PCGrad(GradientBalancer):
             np.random.shuffle(indices)
 
             for j in indices:
-                # Check for conflict
                 dot = torch.dot(grad_i, task_grads[j])
                 if dot < 0:
                     n_conflicts += 1
-                    # Project
+                    # Project onto normal plane
                     grad_j_norm_sq = torch.dot(task_grads[j], task_grads[j])
                     if grad_j_norm_sq > 1e-8:
                         grad_i = grad_i - (dot / grad_j_norm_sq) * task_grads[j]
 
             projected_grads.append(grad_i)
 
-        # Combine projected gradients
-        if self.reduction == 'mean':
-            combined_grad = torch.stack(projected_grads).mean(dim=0)
-        else:
-            combined_grad = torch.stack(projected_grads).sum(dim=0)
+        # Average projected gradients
+        combined_grad = torch.stack(projected_grads).mean(dim=0)
 
-        # Apply combined gradient to parameters
-        idx = 0
-        for param in shared_params:
-            param_size = param.numel()
-            param.grad = combined_grad[idx:idx + param_size].view(param.shape).clone()
-            idx += param_size
-
-        # Return combined loss for logging
-        combined_loss = sum(losses)
+        # Apply to parameters
+        grads = self._unflatten_grads(combined_grad)
+        for param, grad in zip(self.shared_params, grads):
+            if param.grad is None:
+                param.grad = grad.clone()
+            else:
+                param.grad.copy_(grad)
 
         info = {
             'n_conflicts': n_conflicts,
             'conflict_rate': n_conflicts / (n_tasks * (n_tasks - 1)) if n_tasks > 1 else 0
         }
 
-        return combined_loss, info
+        return info
 
 
-class CAGrad(GradientBalancer):
+class DWAOptimizer:
     """
-    Conflict-Averse Gradient Descent (CAGrad).
-
-    Optimizes for the average loss while minimizing worst-case conflict.
-
-    Reference: Liu et al., "Conflict-Averse Gradient Descent for Multi-task Learning", NeurIPS 2021
-    """
-
-    def __init__(self, c: float = 0.5, rescale: bool = True):
-        """
-        Args:
-            c: Trade-off parameter (0 = average, 1 = conflict-averse)
-            rescale: Whether to rescale the gradient
-        """
-        self.c = c
-        self.rescale = rescale
-
-    def balance(
-        self,
-        losses: List[torch.Tensor],
-        shared_params: List[torch.Tensor],
-        **kwargs
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """
-        Compute CAGrad-modified gradients.
-        """
-        n_tasks = len(losses)
-        device = losses[0].device
-
-        # Compute gradients
-        grads = []
-        for loss in losses:
-            grad_list = torch.autograd.grad(
-                loss, shared_params,
-                retain_graph=True,
-                create_graph=False
-            )
-            grad = torch.cat([g.detach().flatten() for g in grad_list])
-            grads.append(grad)
-
-        grads = torch.stack(grads)  # (n_tasks, d)
-
-        # Compute average gradient
-        g_avg = grads.mean(dim=0)
-        g_avg_norm = torch.norm(g_avg)
-
-        if g_avg_norm < 1e-8:
-            # No meaningful gradient
-            return sum(losses), {'cagrad_norm': 0.0}
-
-        # Compute gradient for CAGrad
-        # g_cagrad = g_avg + c * (g_i - g_avg) where i = argmax conflict
-        deviations = grads - g_avg.unsqueeze(0)  # (n_tasks, d)
-
-        # Find most conflicting task
-        conflicts = torch.einsum('td,d->t', deviations, g_avg)
-        worst_idx = conflicts.argmin()
-
-        # Compute CAGrad direction
-        g_cagrad = g_avg + self.c * deviations[worst_idx]
-
-        if self.rescale:
-            g_cagrad = g_cagrad * (g_avg_norm / (torch.norm(g_cagrad) + 1e-8))
-
-        # Apply to parameters
-        idx = 0
-        for param in shared_params:
-            param_size = param.numel()
-            param.grad = g_cagrad[idx:idx + param_size].view(param.shape).clone()
-            idx += param_size
-
-        info = {
-            'cagrad_norm': float(torch.norm(g_cagrad)),
-            'worst_conflict_task': int(worst_idx),
-            'conflict_value': float(conflicts[worst_idx])
-        }
-
-        return sum(losses), info
-
-
-class DynamicWeightAveraging(GradientBalancer):
-    """
-    Dynamic Weight Averaging (DWA).
-
-    Adjusts weights based on rate of loss decrease.
+    Dynamic Weight Averaging.
 
     Reference: Liu et al., "End-to-End Multi-Task Learning with Attention", CVPR 2019
     """
 
     def __init__(self, n_tasks: int, temperature: float = 2.0):
-        """
-        Args:
-            n_tasks: Number of tasks
-            temperature: Temperature for softmax (higher = more uniform)
-        """
         self.n_tasks = n_tasks
         self.temperature = temperature
         self.prev_losses: Optional[torch.Tensor] = None
+        self.step_count = 0
 
-    def balance(
+    def get_weights(
         self,
-        losses: List[torch.Tensor],
-        shared_params: List[torch.Tensor],
-        **kwargs
+        task_losses: List[torch.Tensor]
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Compute DWA-weighted loss."""
-        device = losses[0].device
-        losses_tensor = torch.stack([l.detach() for l in losses])
+        """Compute DWA weights based on loss change rate."""
+        self.step_count += 1
+        device = task_losses[0].device
+
+        losses_tensor = torch.stack([l.detach() for l in task_losses])
 
         if self.prev_losses is None:
-            # First step - equal weights
             weights = torch.ones(self.n_tasks, device=device) / self.n_tasks
         else:
-            # Compute relative loss decrease
-            prev = self.prev_losses.to(device)
-            ratios = losses_tensor / (prev + 1e-8)
-
-            # Softmax with temperature
+            ratios = losses_tensor / (self.prev_losses.to(device) + 1e-8)
             weights = torch.softmax(ratios / self.temperature, dim=0)
 
-        # Update previous losses
-        self.prev_losses = losses_tensor.detach().clone()
-
-        # Compute weighted loss
-        weighted_loss = sum(w * l for w, l in zip(weights, losses))
+        self.prev_losses = losses_tensor.clone()
 
         info = {f'weight_task{i}': float(weights[i]) for i in range(self.n_tasks)}
+        return weights, info
 
-        return weighted_loss, info
 
-
-def get_gradient_balancer(
+def create_gradient_optimizer(
     method: str,
-    n_tasks: int,
+    shared_params: List[nn.Parameter],
+    n_tasks: int = 3,
     **kwargs
-) -> GradientBalancer:
+) -> Union[MGDAOptimizer, GradNormOptimizer, PCGradOptimizer, DWAOptimizer]:
     """
-    Factory function to create gradient balancer.
+    Factory function to create gradient optimizer.
 
     Args:
-        method: Balancing method ('mgda', 'gradnorm', 'pcgrad', 'cagrad', 'dwa', 'equal')
+        method: 'mgda', 'gradnorm', 'pcgrad', 'dwa'
+        shared_params: List of shared parameters
         n_tasks: Number of tasks
         **kwargs: Method-specific arguments
-
-    Returns:
-        GradientBalancer instance
     """
     method = method.lower()
 
     if method == 'mgda':
-        return MGDA(
-            normalize_grads=kwargs.get('normalize_grads', True),
-            use_rep_grad=kwargs.get('use_rep_grad', True)
+        return MGDAOptimizer(
+            shared_params=shared_params,
+            normalize_grads=kwargs.get('normalize_grads', True)
         )
     elif method == 'gradnorm':
-        return GradNorm(
+        return GradNormOptimizer(
             n_tasks=n_tasks,
+            shared_layer=kwargs.get('shared_layer'),
             alpha=kwargs.get('alpha', 1.5),
-            weight_lr=kwargs.get('weight_lr', 0.025)
+            lr=kwargs.get('lr', 0.025)
         )
     elif method == 'pcgrad':
-        return PCGrad(reduction=kwargs.get('reduction', 'mean'))
-    elif method == 'cagrad':
-        return CAGrad(
-            c=kwargs.get('c', 0.5),
-            rescale=kwargs.get('rescale', True)
-        )
+        return PCGradOptimizer(shared_params=shared_params)
     elif method == 'dwa':
-        return DynamicWeightAveraging(
+        return DWAOptimizer(
             n_tasks=n_tasks,
             temperature=kwargs.get('temperature', 2.0)
         )
     else:
-        raise ValueError(f"Unknown gradient balancing method: {method}")
+        raise ValueError(f"Unknown method: {method}")
 
 
 if __name__ == "__main__":
-    # Test gradient balancers
-    print("Testing Gradient Balancers")
-    print("=" * 50)
+    # Test implementations
+    print("Testing Gradient Balancing Implementations")
+    print("=" * 60)
 
-    # Create dummy model and losses
     torch.manual_seed(42)
 
-    # Shared parameters
+    # Create simple model
     shared = nn.Linear(10, 5)
-    x = torch.randn(4, 10)
-
-    # Task-specific heads
     head1 = nn.Linear(5, 1)
     head2 = nn.Linear(5, 1)
     head3 = nn.Linear(5, 1)
 
-    # Forward pass
-    features = shared(x)
-    y1 = head1(features).mean()
-    y2 = head2(features).mean()
-    y3 = head3(features).mean()
-
-    losses = [y1, y2, y3]
-    shared_params = list(shared.parameters())
+    x = torch.randn(4, 10)
 
     # Test MGDA
-    print("\n1. Testing MGDA")
-    mgda = MGDA(normalize_grads=True)
-    loss, info = mgda.balance(losses, shared_params, representations=features)
-    print(f"   MGDA Loss: {loss.item():.4f}")
-    print(f"   Weights: {[f'{info[f'weight_task{i}']:.3f}' for i in range(3)]}")
+    print("\n1. Testing MGDA Optimizer")
+    mgda = MGDAOptimizer(shared_params=list(shared.parameters()))
+
+    features = shared(x)
+    losses = [head1(features).mean(), head2(features).mean(), head3(features).mean()]
+
+    info = mgda.step(losses)
+    print(f"   Weights: [{info['weight_task0']:.3f}, {info['weight_task1']:.3f}, {info['weight_task2']:.3f}]")
     print(f"   Min Norm: {info['min_norm']:.4f}")
+    print(f"   Gradients applied: {shared.weight.grad is not None}")
 
     # Test GradNorm
-    print("\n2. Testing GradNorm")
-    gradnorm = GradNorm(n_tasks=3, alpha=1.5)
+    print("\n2. Testing GradNorm Optimizer")
+    shared.zero_grad()
+    gradnorm = GradNormOptimizer(n_tasks=3, shared_layer=shared, alpha=1.5)
 
-    # Need to recompute losses
     features = shared(x)
-    y1 = head1(features).mean()
-    y2 = head2(features).mean()
-    y3 = head3(features).mean()
-    losses = [y1, y2, y3]
+    losses = [head1(features).mean(), head2(features).mean(), head3(features).mean()]
 
-    loss, info = gradnorm.balance(losses, shared_params, last_shared_layer=shared)
-    print(f"   GradNorm Loss: {loss.item():.4f}")
-    print(f"   Weights: {[f'{info[f'weight_task{i}']:.3f}' for i in range(3)]}")
+    weighted_loss, info = gradnorm.step(losses)
+    print(f"   Weights: [{info['weight_task0']:.3f}, {info['weight_task1']:.3f}, {info['weight_task2']:.3f}]")
+    print(f"   Weighted Loss: {weighted_loss.item():.4f}")
 
     # Test PCGrad
-    print("\n3. Testing PCGrad")
-    pcgrad = PCGrad(reduction='mean')
+    print("\n3. Testing PCGrad Optimizer")
+    shared.zero_grad()
+    pcgrad = PCGradOptimizer(shared_params=list(shared.parameters()))
 
     features = shared(x)
-    y1 = head1(features).mean()
-    y2 = head2(features).mean()
-    y3 = head3(features).mean()
-    losses = [y1, y2, y3]
+    losses = [head1(features).mean(), head2(features).mean(), head3(features).mean()]
 
-    loss, info = pcgrad.balance(losses, shared_params)
-    print(f"   PCGrad Loss: {loss.item():.4f}")
+    info = pcgrad.step(losses)
     print(f"   Conflicts: {info['n_conflicts']}")
     print(f"   Conflict Rate: {info['conflict_rate']:.2%}")
 
-    print("\n" + "=" * 50)
+    print("\n" + "=" * 60)
     print("All tests passed!")

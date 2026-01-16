@@ -55,7 +55,8 @@ class Inferencer:
         for path in self.checkpoint_paths:
             print(f"Loading model from {path}")
             model = create_model(self.config)
-            checkpoint = torch.load(path, map_location='cpu')
+            # weights_only=False needed for PyTorch 2.6+ with numpy scalars
+            checkpoint = torch.load(path, map_location='cpu', weights_only=False)
             model.load_state_dict(checkpoint['model_state_dict'])
             model = model.to(self.device)
             model.eval()

@@ -1,23 +1,19 @@
 """
-Advanced Training Pipeline with MGDA, GradNorm, PCGrad, and MLflow.
+Advanced Training Pipeline with Proper MGDA, GradNorm, PCGrad, and MLflow.
 
-This module extends the base training with:
-1. Advanced gradient balancing (MGDA, GradNorm, PCGrad, CAGrad, DWA)
-2. MLflow experiment tracking with comprehensive logging
-3. GPU profiling and system metrics
-4. Experiment comparison and analysis
+This module implements the ACTUAL gradient balancing algorithms as described in:
+- MTL Survey: https://hav4ik.github.io/articles/mtl-a-practical-survey
+- MGDA Paper: https://arxiv.org/abs/1810.04650
 
-Based on winning strategies from:
-- BioMassters Competition (1st place: U-Net + TTA)
-- Multi-Task Learning Survey (Sener & Koltun, NeurIPS 2018)
-- GradNorm (Chen et al., ICML 2018)
-- PCGrad (Yu et al., NeurIPS 2020)
+Key Algorithm (MGDA):
+1. For each task t: compute ∇_{θ^sh} L^t (T backward passes)
+2. Solve: min ||Σ λ^t ∇L^t||² s.t. Σλ^t=1, λ^t≥0 (Frank-Wolfe)
+3. Apply: θ^sh ← θ^sh - η * Σ λ^t ∇L^t
 
 References:
 - MGDA: https://arxiv.org/abs/1810.04650
 - GradNorm: https://arxiv.org/abs/1711.02257
 - PCGrad: https://arxiv.org/abs/2001.06782
-- BioMassters: https://github.com/drivendataorg/the-biomassters
 """
 
 import os
@@ -37,9 +33,8 @@ from config import Config, get_config
 from dataset import get_dataloaders, MixupCutmix
 from model import BiomassModel, MultiTaskLoss, create_model
 from gradient_balancing import (
-    GradientBalancer,
-    MGDA, GradNorm, PCGrad, CAGrad, DynamicWeightAveraging,
-    get_gradient_balancer
+    MGDAOptimizer, GradNormOptimizer, PCGradOptimizer, DWAOptimizer,
+    create_gradient_optimizer
 )
 from utils import (
     set_seed,
@@ -73,13 +68,12 @@ warnings.filterwarnings('ignore')
 
 class AdvancedTrainer:
     """
-    Advanced trainer with gradient balancing and MLflow tracking.
+    Advanced trainer implementing proper MGDA/GradNorm/PCGrad.
 
-    Features:
-    - MGDA, GradNorm, PCGrad, CAGrad, DWA gradient balancing
-    - MLflow experiment tracking
-    - Comprehensive metrics logging
-    - GPU profiling
+    MGDA Algorithm (from survey):
+    - Step 1: Compute per-task gradients via T backward passes
+    - Step 2: Solve min-norm problem via Frank-Wolfe
+    - Step 3: Apply weighted gradient to shared parameters
     """
 
     def __init__(
@@ -125,7 +119,6 @@ class AdvancedTrainer:
         # Print GPU info
         if torch.cuda.is_available():
             self.logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
-            self.logger.info(f"CUDA Version: {torch.version.cuda}")
 
         # Create dataloaders
         self.logger.info("Creating dataloaders...")
@@ -139,28 +132,24 @@ class AdvancedTrainer:
         # Use channels_last memory format
         if config.gpu.channels_last and torch.cuda.is_available():
             self.model = self.model.to(memory_format=torch.channels_last)
-            self.logger.info("Using channels_last memory format")
 
         # Optional model compilation
         if compile_model_flag:
             self.model = compile_model(self.model, mode="reduce-overhead")
 
-        # Base loss function (for non-gradient-balancing methods)
-        self.criterion = MultiTaskLoss(config)
+        # Loss function
+        if config.training.loss_type == "mse":
+            self.loss_fn = nn.MSELoss(reduction='mean')
+        elif config.training.loss_type == "huber":
+            self.loss_fn = nn.HuberLoss(delta=config.training.huber_delta, reduction='mean')
+        else:
+            self.loss_fn = nn.SmoothL1Loss(reduction='mean')
 
-        # Setup gradient balancer
-        self._setup_gradient_balancer()
+        # Setup gradient optimizer based on method
+        self._setup_gradient_optimizer()
 
-        # Optimizer
+        # Main optimizer for all parameters
         param_groups = self.model.get_param_groups(config)
-
-        # Add GradNorm weights to optimizer if using GradNorm
-        if isinstance(self.gradient_balancer, GradNorm):
-            param_groups.append({
-                'params': [self.gradient_balancer.log_weights],
-                'lr': config.gradient_balancing.gradnorm_weight_lr
-            })
-
         self.optimizer = torch.optim.AdamW(
             param_groups,
             lr=config.training.learning_rate,
@@ -188,58 +177,72 @@ class AdvancedTrainer:
             verbose=True
         )
 
-        # Mixed precision
-        self.scaler = GradScaler() if config.training.use_amp else None
+        # Mixed precision - NOTE: MGDA/PCGrad don't work well with AMP scaler
+        # because they compute gradients manually
+        self.use_amp = config.training.use_amp
+        self.scaler = GradScaler() if self.use_amp and not self.uses_manual_grads else None
 
-        # Mixup
-        self.mixup = MixupCutmix(
-            mixup_alpha=config.augmentation.mixup_alpha,
-            cutmix_alpha=config.augmentation.cutmix_alpha
-        )
+        # Mixup (disabled for proper gradient computation)
+        # Mixup complicates gradient balancing - disable for MGDA/PCGrad
+        self.use_mixup = config.augmentation.mixup_alpha > 0 and not self.uses_manual_grads
+        if self.use_mixup:
+            self.mixup = MixupCutmix(
+                mixup_alpha=config.augmentation.mixup_alpha,
+                cutmix_alpha=config.augmentation.cutmix_alpha
+            )
 
         # Tracking
         self.best_score = -float('inf')
         self.best_epoch = 0
         self.global_step = 0
 
-    def _setup_gradient_balancer(self):
-        """Setup gradient balancing method."""
-        gb_config = self.config.gradient_balancing
-        method = gb_config.method.lower()
+    def _setup_gradient_optimizer(self):
+        """Setup the gradient balancing optimizer."""
+        method = self.config.gradient_balancing.method.lower()
+        self.gradient_method = method
 
-        self.use_advanced_balancing = method in ['mgda', 'gradnorm', 'pcgrad', 'cagrad', 'dwa']
+        # Methods that compute gradients manually (no loss.backward())
+        self.uses_manual_grads = method in ['mgda', 'pcgrad']
 
-        if self.use_advanced_balancing:
-            self.logger.info(f"Using advanced gradient balancing: {method}")
+        # Get shared parameters (backbone + fusion layer)
+        self.shared_params = list(self.model.backbone.parameters()) + \
+                             list(self.model.fusion.parameters())
 
-            if method == 'mgda':
-                self.gradient_balancer = MGDA(
-                    normalize_grads=gb_config.mgda_normalize,
-                    use_rep_grad=gb_config.mgda_use_rep_grad
-                )
-            elif method == 'gradnorm':
-                self.gradient_balancer = GradNorm(
-                    n_tasks=3,  # 3 base targets
-                    alpha=gb_config.gradnorm_alpha,
-                    weight_lr=gb_config.gradnorm_weight_lr
-                )
-            elif method == 'pcgrad':
-                self.gradient_balancer = PCGrad(
-                    reduction=gb_config.pcgrad_reduction
-                )
-            elif method == 'cagrad':
-                self.gradient_balancer = CAGrad(
-                    c=gb_config.cagrad_c,
-                    rescale=gb_config.cagrad_rescale
-                )
-            elif method == 'dwa':
-                self.gradient_balancer = DynamicWeightAveraging(
-                    n_tasks=3,
-                    temperature=gb_config.dwa_temperature
-                )
+        self.logger.info(f"Gradient balancing method: {method}")
+        self.logger.info(f"Shared parameters: {sum(p.numel() for p in self.shared_params):,}")
+
+        if method == 'mgda':
+            self.grad_optimizer = MGDAOptimizer(
+                shared_params=self.shared_params,
+                normalize_grads=self.config.gradient_balancing.mgda_normalize
+            )
+            self.logger.info("Using MGDA with Frank-Wolfe solver (proper implementation)")
+
+        elif method == 'pcgrad':
+            self.grad_optimizer = PCGradOptimizer(shared_params=self.shared_params)
+            self.logger.info("Using PCGrad with gradient projection")
+
+        elif method == 'gradnorm':
+            self.grad_optimizer = GradNormOptimizer(
+                n_tasks=3,
+                shared_layer=self.model.fusion,
+                alpha=self.config.gradient_balancing.gradnorm_alpha,
+                lr=self.config.gradient_balancing.gradnorm_weight_lr
+            )
+            self.logger.info(f"Using GradNorm with alpha={self.config.gradient_balancing.gradnorm_alpha}")
+
+        elif method == 'dwa':
+            self.grad_optimizer = DWAOptimizer(
+                n_tasks=3,
+                temperature=self.config.gradient_balancing.dwa_temperature
+            )
+            self.logger.info("Using Dynamic Weight Averaging")
+
         else:
-            self.gradient_balancer = None
-            self.logger.info(f"Using basic loss weighting: {method}")
+            # Fallback to standard weighted loss
+            self.grad_optimizer = None
+            self.uses_manual_grads = False
+            self.logger.info("Using standard loss weighting")
 
     def _compute_task_losses(
         self,
@@ -247,34 +250,134 @@ class AdvancedTrainer:
         targets: torch.Tensor
     ) -> List[torch.Tensor]:
         """Compute individual task losses."""
-        # predictions: (batch, 3), targets: (batch, 3)
-        losses = []
-
-        # Get base loss function
-        if self.config.training.loss_type == "mse":
-            loss_fn = nn.MSELoss(reduction='mean')
-        elif self.config.training.loss_type == "huber":
-            loss_fn = nn.HuberLoss(delta=self.config.training.huber_delta, reduction='mean')
-        else:
-            loss_fn = nn.SmoothL1Loss(reduction='mean')
-
+        task_losses = []
         for i in range(3):
-            task_loss = loss_fn(predictions[:, i], targets[:, i])
-            losses.append(task_loss)
+            task_loss = self.loss_fn(predictions[:, i], targets[:, i])
+            task_losses.append(task_loss)
+        return task_losses
 
-        return losses
+    def train_epoch_mgda(self, epoch: int) -> Dict[str, float]:
+        """
+        Train one epoch using MGDA/PCGrad (manual gradient computation).
 
-    def train_epoch(self, epoch: int) -> Dict[str, float]:
-        """Train for one epoch with advanced gradient balancing."""
+        Algorithm:
+        1. Forward pass to get predictions
+        2. Compute per-task losses
+        3. MGDA: compute per-task gradients → solve min-norm → apply weighted grad
+        4. Optimizer step
+        """
         self.model.train()
 
         losses = AverageMeter()
         loss_green = AverageMeter()
         loss_dead = AverageMeter()
         loss_clover = AverageMeter()
-
-        # Track gradient balancing info
         grad_info_accum = {}
+
+        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}")
+        for step, batch in enumerate(pbar):
+            # Move to device
+            images = batch['image'].to(self.device, non_blocking=True)
+            metadata = batch['metadata'].to(self.device, non_blocking=True)
+            targets = batch['targets'].to(self.device, non_blocking=True)
+
+            if self.config.gpu.channels_last:
+                images = images.to(memory_format=torch.channels_last)
+
+            # Zero gradients
+            self.optimizer.zero_grad(set_to_none=True)
+
+            # Forward pass (with autocast for speed, gradients computed outside)
+            with autocast(enabled=self.use_amp):
+                output = self.model(images, metadata)
+                predictions = output['base_preds']
+
+            # Compute per-task losses (outside autocast for gradient computation)
+            # Convert to float32 for stable gradient computation
+            predictions_fp32 = predictions.float()
+            targets_fp32 = targets.float()
+            task_losses = self._compute_task_losses(predictions_fp32, targets_fp32)
+
+            # Apply gradient balancing (computes and applies gradients to shared params)
+            info = self.grad_optimizer.step(task_losses, retain_graph=True)
+
+            # Compute gradients for task-specific parameters
+            # (heads get standard gradients from sum of losses)
+            total_loss = sum(task_losses)
+            head_params = list(self.model.head_green.parameters()) + \
+                          list(self.model.head_dead.parameters()) + \
+                          list(self.model.head_clover.parameters())
+
+            head_grads = torch.autograd.grad(
+                total_loss, head_params,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=True
+            )
+
+            # Apply head gradients
+            for param, grad in zip(head_params, head_grads):
+                if grad is not None:
+                    param.grad = grad
+
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(),
+                self.config.training.max_grad_norm
+            )
+
+            # Optimizer step
+            self.optimizer.step()
+            self.scheduler.step()
+            self.global_step += 1
+
+            # Update metrics
+            batch_size = images.size(0)
+            losses.update(total_loss.item(), batch_size)
+            loss_green.update(task_losses[0].item(), batch_size)
+            loss_dead.update(task_losses[1].item(), batch_size)
+            loss_clover.update(task_losses[2].item(), batch_size)
+
+            # Accumulate gradient info
+            for k, v in info.items():
+                if k not in grad_info_accum:
+                    grad_info_accum[k] = []
+                grad_info_accum[k].append(v)
+
+            # Clear cache periodically
+            if self.config.gpu.empty_cache_freq > 0 and (step + 1) % self.config.gpu.empty_cache_freq == 0:
+                clear_gpu_cache()
+
+            # Update progress bar
+            pbar.set_postfix({
+                'loss': f"{losses.avg:.4f}",
+                'lr': f"{self.optimizer.param_groups[0]['lr']:.2e}"
+            })
+
+        # Average gradient info
+        avg_info = {k: np.mean(v) for k, v in grad_info_accum.items()}
+
+        return {
+            'loss': losses.avg,
+            'loss_green': loss_green.avg,
+            'loss_dead': loss_dead.avg,
+            'loss_clover': loss_clover.avg,
+            **avg_info
+        }
+
+    def train_epoch_weighted(self, epoch: int) -> Dict[str, float]:
+        """
+        Train one epoch using weighted loss (GradNorm, DWA, or standard).
+
+        Uses normal loss.backward() with dynamically computed weights.
+        """
+        self.model.train()
+
+        losses = AverageMeter()
+        loss_green = AverageMeter()
+        loss_dead = AverageMeter()
+        loss_clover = AverageMeter()
+        weight_accum = {f'weight_task{i}': [] for i in range(3)}
 
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -288,84 +391,40 @@ class AdvancedTrainer:
             if self.config.gpu.channels_last:
                 images = images.to(memory_format=torch.channels_last)
 
-            # Apply mixup
-            if self.config.augmentation.mixup_alpha > 0:
+            # Apply mixup if enabled
+            if self.use_mixup:
                 images, targets_a, targets_b, lam = self.mixup(images, targets)
             else:
                 targets_a, targets_b, lam = targets, targets, 1.0
 
             # Forward pass with AMP
-            with autocast(enabled=self.config.training.use_amp):
-                output = self.model(images, metadata, return_features=True)
+            with autocast(enabled=self.use_amp):
+                output = self.model(images, metadata)
                 predictions = output['base_preds']
 
-                if self.use_advanced_balancing:
-                    # Compute individual task losses
-                    task_losses_a = self._compute_task_losses(predictions, targets_a)
-                    task_losses_b = self._compute_task_losses(predictions, targets_b)
+                # Compute task losses
+                task_losses_a = self._compute_task_losses(predictions, targets_a)
+                task_losses_b = self._compute_task_losses(predictions, targets_b)
 
-                    # Apply gradient balancing
-                    # Get shared parameters (backbone + fusion)
-                    shared_params = list(self.model.backbone.parameters()) + \
-                                    list(self.model.fusion.parameters())
+                # Get weights and compute weighted loss
+                if isinstance(self.grad_optimizer, GradNormOptimizer):
+                    weighted_loss_a, info_a = self.grad_optimizer.step(task_losses_a)
+                    weighted_loss_b, info_b = self.grad_optimizer.step(task_losses_b)
+                    loss = lam * weighted_loss_a + (1 - lam) * weighted_loss_b
+                    info = info_a
 
-                    # For MGDA, we can use representation gradients
-                    representations = output.get('fused_features', None)
-
-                    # Get last shared layer for GradNorm
-                    last_shared_layer = self.model.fusion
-
-                    # Compute balanced loss
-                    if isinstance(self.gradient_balancer, GradNorm):
-                        loss_a, grad_info_a = self.gradient_balancer.balance(
-                            task_losses_a, shared_params,
-                            last_shared_layer=last_shared_layer
-                        )
-                        loss_b, grad_info_b = self.gradient_balancer.balance(
-                            task_losses_b, shared_params,
-                            last_shared_layer=last_shared_layer
-                        )
-                        grad_info = grad_info_a
-                    elif isinstance(self.gradient_balancer, MGDA):
-                        loss_a, grad_info_a = self.gradient_balancer.balance(
-                            task_losses_a, shared_params,
-                            representations=representations
-                        )
-                        loss_b, grad_info_b = self.gradient_balancer.balance(
-                            task_losses_b, shared_params,
-                            representations=representations
-                        )
-                        grad_info = grad_info_a
-                    elif isinstance(self.gradient_balancer, (PCGrad, CAGrad)):
-                        # PCGrad/CAGrad modify gradients directly
-                        loss_a, grad_info_a = self.gradient_balancer.balance(
-                            task_losses_a, shared_params
-                        )
-                        loss_b, grad_info_b = self.gradient_balancer.balance(
-                            task_losses_b, shared_params
-                        )
-                        grad_info = grad_info_a
-                    else:
-                        loss_a, grad_info_a = self.gradient_balancer.balance(
-                            task_losses_a, shared_params
-                        )
-                        loss_b, grad_info_b = self.gradient_balancer.balance(
-                            task_losses_b, shared_params
-                        )
-                        grad_info = grad_info_a
-
+                elif isinstance(self.grad_optimizer, DWAOptimizer):
+                    weights, info = self.grad_optimizer.get_weights(task_losses_a)
+                    loss_a = sum(w * l for w, l in zip(weights, task_losses_a))
+                    loss_b = sum(w * l for w, l in zip(weights, task_losses_b))
                     loss = lam * loss_a + (1 - lam) * loss_b
 
-                    # Accumulate gradient info
-                    for k, v in grad_info.items():
-                        if k not in grad_info_accum:
-                            grad_info_accum[k] = []
-                        grad_info_accum[k].append(v)
                 else:
-                    # Use standard loss
-                    loss_a, loss_dict_a = self.criterion(predictions, targets_a)
-                    loss_b, loss_dict_b = self.criterion(predictions, targets_b)
+                    # Standard equal weighting
+                    loss_a = sum(task_losses_a) / 3
+                    loss_b = sum(task_losses_b) / 3
                     loss = lam * loss_a + (1 - lam) * loss_b
+                    info = {f'weight_task{i}': 1/3 for i in range(3)}
 
                 loss = loss / self.config.training.accumulation_steps
 
@@ -375,7 +434,7 @@ class AdvancedTrainer:
             else:
                 loss.backward()
 
-            # Gradient accumulation
+            # Gradient accumulation step
             if (step + 1) % self.config.training.accumulation_steps == 0:
                 if self.scaler is not None:
                     self.scaler.unscale_(self.optimizer)
@@ -399,34 +458,39 @@ class AdvancedTrainer:
             # Update metrics
             batch_size = images.size(0)
             losses.update(loss.item() * self.config.training.accumulation_steps, batch_size)
+            loss_green.update(task_losses_a[0].item(), batch_size)
+            loss_dead.update(task_losses_a[1].item(), batch_size)
+            loss_clover.update(task_losses_a[2].item(), batch_size)
 
-            # Compute individual task losses for logging
-            with torch.no_grad():
-                task_losses = self._compute_task_losses(predictions, targets_a)
-                loss_green.update(task_losses[0].item(), batch_size)
-                loss_dead.update(task_losses[1].item(), batch_size)
-                loss_clover.update(task_losses[2].item(), batch_size)
+            # Track weights
+            for i in range(3):
+                weight_accum[f'weight_task{i}'].append(info.get(f'weight_task{i}', 1/3))
 
-            # Clear GPU cache periodically
+            # Clear cache periodically
             if self.config.gpu.empty_cache_freq > 0 and (step + 1) % self.config.gpu.empty_cache_freq == 0:
                 clear_gpu_cache()
 
-            # Update progress bar
             pbar.set_postfix({
                 'loss': f"{losses.avg:.4f}",
                 'lr': f"{self.optimizer.param_groups[0]['lr']:.2e}"
             })
 
-        # Average gradient info
-        avg_grad_info = {k: np.mean(v) for k, v in grad_info_accum.items()}
+        avg_weights = {k: np.mean(v) for k, v in weight_accum.items()}
 
         return {
             'loss': losses.avg,
             'loss_green': loss_green.avg,
             'loss_dead': loss_dead.avg,
             'loss_clover': loss_clover.avg,
-            **avg_grad_info
+            **avg_weights
         }
+
+    def train_epoch(self, epoch: int) -> Dict[str, float]:
+        """Route to appropriate training method."""
+        if self.uses_manual_grads:
+            return self.train_epoch_mgda(epoch)
+        else:
+            return self.train_epoch_weighted(epoch)
 
     @torch.no_grad()
     def validate(self) -> Tuple[Dict[str, float], float]:
@@ -443,7 +507,7 @@ class AdvancedTrainer:
             if self.config.gpu.channels_last:
                 images = images.to(memory_format=torch.channels_last)
 
-            with autocast(enabled=self.config.training.use_amp):
+            with autocast(enabled=self.use_amp):
                 predictions = self.model.predict_all_targets(
                     images, metadata,
                     use_log_transform=self.config.training.use_log_transform
@@ -471,7 +535,7 @@ class AdvancedTrainer:
         return metrics, weighted_r2
 
     def train(self) -> Dict[str, float]:
-        """Full training loop with MLflow tracking."""
+        """Full training loop."""
         # Start MLflow run
         if self.tracker is not None:
             self.tracker.start_run()
@@ -479,11 +543,12 @@ class AdvancedTrainer:
 
         self.logger.info("=" * 50)
         self.logger.info(f"Starting training for fold {self.fold}")
-        self.logger.info(f"Gradient balancing: {self.config.gradient_balancing.method}")
-        self.logger.info(f"Epochs: {self.config.training.epochs}")
+        self.logger.info(f"Gradient method: {self.gradient_method}")
+        self.logger.info(f"Uses manual gradients: {self.uses_manual_grads}")
         self.logger.info("=" * 50)
 
         start_time = time.time()
+        total_time = 0
 
         try:
             for epoch in range(1, self.config.training.epochs + 1):
@@ -506,14 +571,6 @@ class AdvancedTrainer:
                         lr=self.optimizer.param_groups[0]['lr']
                     )
 
-                    # Log gradient balancing info
-                    grad_keys = [k for k in train_metrics.keys()
-                                 if k.startswith('weight_') or k.startswith('min_norm')
-                                 or k.startswith('n_conflicts')]
-                    if grad_keys:
-                        grad_info = {k: train_metrics[k] for k in grad_keys}
-                        self.tracker.log_gradients_info(grad_info, epoch)
-
                 # Log to console
                 self.logger.info(
                     f"Epoch {epoch}/{self.config.training.epochs} | "
@@ -528,14 +585,19 @@ class AdvancedTrainer:
                     " | ".join([f"{k}: {v:.4f}" for k, v in val_metrics.items() if k.startswith('r2_')])
                 )
 
-                # Log gradient balancing weights
-                if self.use_advanced_balancing:
+                # Log task weights / MGDA info
+                if 'weight_task0' in train_metrics:
                     weight_info = " | ".join([
-                        f"{k}: {v:.3f}" for k, v in train_metrics.items()
-                        if k.startswith('weight_task')
+                        f"w{i}: {train_metrics.get(f'weight_task{i}', 0.33):.3f}"
+                        for i in range(3)
                     ])
-                    if weight_info:
-                        self.logger.info(f"  Task weights: {weight_info}")
+                    self.logger.info(f"  Task weights: {weight_info}")
+
+                if 'min_norm' in train_metrics:
+                    self.logger.info(f"  MGDA min_norm: {train_metrics['min_norm']:.4f}")
+
+                if 'n_conflicts' in train_metrics:
+                    self.logger.info(f"  PCGrad conflicts: {train_metrics['n_conflicts']:.1f}")
 
                 # Save best model
                 if val_score > self.best_score:
@@ -553,38 +615,27 @@ class AdvancedTrainer:
                     )
                     self.logger.info(f"  New best model saved! R²: {val_score:.4f}")
 
-                    # Log checkpoint to MLflow
-                    if self.tracker is not None and self.config.mlflow.log_checkpoints:
-                        self.tracker.log_checkpoint(checkpoint_path)
-
                 # Early stopping
                 if self.early_stopping(val_score):
-                    self.logger.info(f"Early stopping triggered at epoch {epoch}")
+                    self.logger.info(f"Early stopping at epoch {epoch}")
                     break
 
             total_time = time.time() - start_time
 
-            # Log final results
             self.logger.info("=" * 50)
             self.logger.info(f"Training completed in {format_time(total_time)}")
             self.logger.info(f"Best R²: {self.best_score:.4f} at epoch {self.best_epoch}")
 
-            # Log model to MLflow
+            # Log final metrics to MLflow
             if self.tracker is not None:
                 self.tracker.log_metric("best_r2", self.best_score)
                 self.tracker.log_metric("best_epoch", self.best_epoch)
                 self.tracker.log_metric("total_time_seconds", total_time)
 
-                if self.config.mlflow.log_model:
-                    # Load best model and log
-                    best_path = self.config.training.save_dir / f"best_fold{self.fold}.pt"
-                    if best_path.exists():
-                        checkpoint = torch.load(best_path, map_location='cpu')
-                        self.model.load_state_dict(checkpoint['model_state_dict'])
-                        self.tracker.log_model(self.model, artifact_path=f"model_fold{self.fold}")
-
+        except Exception as e:
+            self.logger.error(f"Training failed: {e}")
+            raise
         finally:
-            # End MLflow run
             if self.tracker is not None:
                 self.tracker.end_run()
 
@@ -614,7 +665,7 @@ def train_cv_advanced(
     config: Config,
     compile_model_flag: bool = False
 ) -> Dict[str, float]:
-    """Train with cross-validation and advanced features."""
+    """Train with cross-validation."""
     results = []
 
     for fold in range(config.training.n_folds):
@@ -631,7 +682,6 @@ def train_cv_advanced(
         )
         results.append(fold_result)
 
-    # Aggregate results
     cv_scores = [r['best_score'] for r in results]
     mean_score = np.mean(cv_scores)
     std_score = np.std(cv_scores)
@@ -654,24 +704,18 @@ def train_cv_advanced(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Advanced Training with Gradient Balancing")
-    parser.add_argument('--backbone', type=str, default='convnext_base',
-                        choices=['convnext_base', 'convnext_large', 'efficientnetv2_m',
-                                 'swin_base_patch4_window12_384'])
+    parser = argparse.ArgumentParser(description="Advanced Training with Proper MGDA")
+    parser.add_argument('--backbone', type=str, default='convnext_base')
     parser.add_argument('--gradient_method', type=str, default='mgda',
-                        choices=['equal', 'competition', 'uncertainty',
-                                 'mgda', 'gradnorm', 'pcgrad', 'cagrad', 'dwa'])
-    parser.add_argument('--fold', type=int, default=None,
-                        help='Train single fold (0-4)')
+                        choices=['equal', 'competition', 'mgda', 'gradnorm', 'pcgrad', 'dwa'])
+    parser.add_argument('--fold', type=int, default=None)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--no_mlflow', action='store_true', help='Disable MLflow tracking')
-    parser.add_argument('--experiment_name', type=str, default='csiro_biomass')
+    parser.add_argument('--no_mlflow', action='store_true')
     args = parser.parse_args()
 
-    # Create config
     config = get_config(args.backbone)
     config.training.epochs = args.epochs
     config.training.batch_size = args.batch_size
@@ -679,9 +723,7 @@ if __name__ == "__main__":
     config.training.seed = args.seed
     config.gradient_balancing.method = args.gradient_method
     config.mlflow.enabled = not args.no_mlflow
-    config.mlflow.experiment_name = args.experiment_name
 
-    # Train
     if args.fold is not None:
         result = train_fold_advanced(config, args.fold)
         print(f"Fold {args.fold} Best R²: {result['best_score']:.4f}")

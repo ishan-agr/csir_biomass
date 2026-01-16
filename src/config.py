@@ -69,7 +69,7 @@ class DataConfig:
 class ModelConfig:
     """Model architecture configuration."""
     # Backbone selection
-    backbone: str = "convnext_base"  # Options: convnext_base, efficientnetv2_m, swin_base_patch4_window12_384
+    backbone: str = "convnext_large"  # Options: convnext_base, efficientnetv2_m, swin_base_patch4_window12_384
     pretrained: bool = True
 
     # Feature dimensions (will be set based on backbone)

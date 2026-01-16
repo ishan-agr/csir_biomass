@@ -563,7 +563,8 @@ def load_checkpoint(
     scheduler: Optional[_LRScheduler] = None
 ) -> Tuple[nn.Module, int, float]:
     """Load training checkpoint."""
-    checkpoint = torch.load(path, map_location='cpu')
+    # weights_only=False needed for PyTorch 2.6+ with numpy scalars in checkpoint
+    checkpoint = torch.load(path, map_location='cpu', weights_only=False)
 
     model.load_state_dict(checkpoint['model_state_dict'])
 
