@@ -214,9 +214,11 @@ class AdvancedTrainer:
         if method == 'mgda':
             self.grad_optimizer = MGDAOptimizer(
                 shared_params=self.shared_params,
-                normalize_grads=self.config.gradient_balancing.mgda_normalize
+                normalize_grads=self.config.gradient_balancing.mgda_normalize,
+                rescale_grads=self.config.gradient_balancing.mgda_rescale
             )
             self.logger.info("Using MGDA with Frank-Wolfe solver (proper implementation)")
+            self.logger.info(f"  normalize_grads={self.config.gradient_balancing.mgda_normalize}, rescale_grads={self.config.gradient_balancing.mgda_rescale}")
 
         elif method == 'pcgrad':
             self.grad_optimizer = PCGradOptimizer(shared_params=self.shared_params)
@@ -595,6 +597,9 @@ class AdvancedTrainer:
 
                 if 'min_norm' in train_metrics:
                     self.logger.info(f"  MGDA min_norm: {train_metrics['min_norm']:.4f}")
+
+                if 'avg_grad_norm' in train_metrics:
+                    self.logger.info(f"  Avg gradient norm: {train_metrics['avg_grad_norm']:.4f}")
 
                 if 'n_conflicts' in train_metrics:
                     self.logger.info(f"  PCGrad conflicts: {train_metrics['n_conflicts']:.1f}")

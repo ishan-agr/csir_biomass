@@ -8,7 +8,7 @@ Usage:
     # Train with advanced gradient balancing (MGDA)
     python main.py train --fold 0 --gradient_method mgda
 
-    # Train all folds (cross-validation) with GradNorm
+    # Train all folds (cross-validation) with    GradNorm
     python main.py train --cv --gradient_method gradnorm
 
     # Generate submission

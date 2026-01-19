@@ -142,23 +142,30 @@ class MGDAOptimizer:
     3. Apply: θ^sh ← θ^sh - η * Σ λ^t ∇L^t
 
     This guarantees Pareto improvement at each step.
+
+    IMPORTANT: Gradient normalization for solving vs applying:
+    - Normalize when solving the min-norm problem (for numerical stability)
+    - Apply weights to UNNORMALIZED gradients (to preserve magnitude)
     """
 
     def __init__(
         self,
         shared_params: List[nn.Parameter],
         task_specific_params: Optional[List[List[nn.Parameter]]] = None,
-        normalize_grads: bool = True
+        normalize_grads: bool = True,
+        rescale_grads: bool = True
     ):
         """
         Args:
             shared_params: List of shared parameters (backbone, fusion)
             task_specific_params: Optional list of task-specific param lists
-            normalize_grads: Whether to normalize gradients before solving
+            normalize_grads: Whether to normalize gradients for MGDA solver
+            rescale_grads: Whether to rescale final gradient (important!)
         """
         self.shared_params = list(shared_params)
         self.task_specific_params = task_specific_params or []
         self.normalize_grads = normalize_grads
+        self.rescale_grads = rescale_grads
 
         # Track gradient shapes for reconstruction
         self._grad_shapes = [p.shape for p in self.shared_params]
@@ -181,20 +188,25 @@ class MGDAOptimizer:
         self,
         task_losses: List[torch.Tensor],
         retain_graph: bool = True
-    ) -> List[torch.Tensor]:
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[float]]:
         """
         Compute gradients for each task w.r.t. shared parameters.
 
         This is the key step: T backward passes to get T gradient vectors.
+        Returns both normalized (for solver) and raw (for applying) gradients.
 
         Args:
             task_losses: List of scalar loss tensors (one per task)
             retain_graph: Whether to retain computation graph
 
         Returns:
-            List of flattened gradient tensors
+            normalized_grads: Normalized gradients for MGDA solver
+            raw_grads: Original gradients for weighted combination
+            grad_norms: Original gradient norms
         """
-        task_grads = []
+        raw_grads = []
+        normalized_grads = []
+        grad_norms = []
 
         for i, loss in enumerate(task_losses):
             # Compute gradient for this task
@@ -212,16 +224,20 @@ class MGDAOptimizer:
 
             # Flatten to single vector
             flat_grad = self._flatten_grads(grads)
+            raw_grads.append(flat_grad)
 
-            # Optionally normalize
-            if self.normalize_grads:
-                grad_norm = flat_grad.norm()
-                if grad_norm > 1e-8:
-                    flat_grad = flat_grad / grad_norm
+            # Compute norm
+            grad_norm = flat_grad.norm().item()
+            grad_norms.append(grad_norm)
 
-            task_grads.append(flat_grad)
+            # Normalize for solver (if enabled)
+            if self.normalize_grads and grad_norm > 1e-8:
+                normalized_grad = flat_grad / grad_norm
+            else:
+                normalized_grad = flat_grad
+            normalized_grads.append(normalized_grad)
 
-        return task_grads
+        return normalized_grads, raw_grads, grad_norms
 
     def solve_mgda(
         self,
@@ -231,7 +247,7 @@ class MGDAOptimizer:
         Solve MGDA optimization problem using Frank-Wolfe.
 
         Args:
-            task_grads: List of flattened gradient tensors
+            task_grads: List of (normalized) flattened gradient tensors
 
         Returns:
             weights: Optimal task weights
@@ -248,20 +264,37 @@ class MGDAOptimizer:
 
     def get_weighted_grad(
         self,
-        task_grads: List[torch.Tensor],
-        weights: torch.Tensor
+        raw_grads: List[torch.Tensor],
+        weights: torch.Tensor,
+        grad_norms: List[float]
     ) -> torch.Tensor:
         """
         Compute weighted combination of task gradients.
 
+        CRITICAL: Uses RAW (unnormalized) gradients to preserve magnitude.
+
         Args:
-            task_grads: List of flattened gradient tensors
+            raw_grads: List of unnormalized flattened gradient tensors
             weights: Task weights from MGDA solver
+            grad_norms: Original gradient norms (for potential rescaling)
 
         Returns:
             Weighted gradient vector
         """
-        weighted_grad = sum(w * g for w, g in zip(weights, task_grads))
+        # Apply weights to RAW gradients (not normalized!)
+        weighted_grad = sum(w * g for w, g in zip(weights, raw_grads))
+
+        # Optional: rescale to match average gradient magnitude
+        # This helps maintain learning rate semantics
+        if self.rescale_grads and grad_norms:
+            avg_norm = sum(grad_norms) / len(grad_norms)
+            current_norm = weighted_grad.norm().item()
+            if current_norm > 1e-8:
+                scale_factor = avg_norm / current_norm
+                # Don't scale too much - clamp the factor
+                scale_factor = min(max(scale_factor, 0.1), 10.0)
+                weighted_grad = weighted_grad * scale_factor
+
         return weighted_grad
 
     def apply_gradients(self, weighted_grad: torch.Tensor):
@@ -294,16 +327,22 @@ class MGDAOptimizer:
             info: Dictionary with MGDA information
         """
         # Step 1: Compute per-task gradients (T backward passes)
-        task_grads = self.compute_task_gradients(task_losses, retain_graph)
+        # Get both normalized (for solver) and raw (for applying) gradients
+        normalized_grads, raw_grads, grad_norms = self.compute_task_gradients(
+            task_losses, retain_graph
+        )
 
-        # Step 2: Solve MGDA optimization
-        weights, info = self.solve_mgda(task_grads)
+        # Step 2: Solve MGDA optimization using normalized gradients
+        weights, info = self.solve_mgda(normalized_grads)
 
-        # Step 3: Compute weighted gradient
-        weighted_grad = self.get_weighted_grad(task_grads, weights)
+        # Step 3: Compute weighted gradient using RAW gradients
+        weighted_grad = self.get_weighted_grad(raw_grads, weights, grad_norms)
 
         # Step 4: Apply to shared parameters
         self.apply_gradients(weighted_grad)
+
+        # Add gradient norm info
+        info['avg_grad_norm'] = sum(grad_norms) / len(grad_norms) if grad_norms else 0
 
         return info
 

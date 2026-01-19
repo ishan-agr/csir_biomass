@@ -127,7 +127,8 @@ class GradientBalancingConfig:
     method: str = "mgda"
 
     # MGDA settings
-    mgda_normalize: bool = True  # Normalize gradients before solving
+    mgda_normalize: bool = True  # Normalize gradients for solver (numerical stability)
+    mgda_rescale: bool = True  # Rescale weighted gradient to match original magnitude (important!)
     mgda_use_rep_grad: bool = True  # Use representation gradients (more efficient)
 
     # GradNorm settings
