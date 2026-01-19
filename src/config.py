@@ -22,7 +22,7 @@ import torch
 @dataclass
 class DataConfig:
     """Data configuration."""
-    data_dir: Path = Path(r"/kaggle/input/csiro-biomass/")
+    data_dir: Path = Path(r"/workspace/data/csiro-biomass/csiro-biomass/")
     train_csv: str = "train.csv"
     test_csv: str = "test.csv"
 
@@ -208,7 +208,7 @@ class TrainingConfig:
     min_delta: float = 1e-4
 
     # Checkpointing
-    save_dir: Path = Path(r"/kaggle/working/checkpoints")
+    save_dir: Path = Path(r"/workspace/data/csiro-biomass/csiro-biomass/checkpoints")
     save_best_only: bool = True
 
     # Mixed precision
@@ -260,7 +260,7 @@ class InferenceConfig:
     ensemble_weights: Optional[List[float]] = None  # None = equal weights
 
     # Output
-    output_dir: Path = Path(r"/kaggle/working/submissions")
+    output_dir: Path = Path(r"/workspace/data/csiro-biomass/csiro-biomass/submissions")
     submission_name: str = "submission.csv"
 
 
