@@ -141,7 +141,6 @@ class BiomassModel(nn.Module):
         super().__init__()
         self.config = config
         model_cfg = config.model
-
         # Backbone (pretrained)
         self.backbone = self._create_backbone(model_cfg)
 
@@ -286,18 +285,21 @@ class BiomassModel(nn.Module):
         """
         output = self.forward(images, metadata)
         base_preds = output['base_preds']  # (batch, 3) in log space
-
+        if not self.training:
+            print(f"DEBUG base_preds (log space): min={base_preds.min().item():.2f}, max={base_preds.max().item():.2f}, mean={base_preds.mean().item():.2f}")
+        print(f"RAW base_preds: min={base_preds.min().item():.2f}, max={base_preds.max().item():.2f}")
         if use_log_transform:
             # Clamp predictions BEFORE expm1 to prevent explosion
             # log1p(1000) ≈ 6.9, so clamp to reasonable range
-            base_preds = torch.clamp(base_preds, min=-5, max=10)
+            base_preds = torch.clamp(base_preds, min=-1, max=5.5)
+            base_preds_orig = torch.expm1(base_preds)
             # Convert from log space to original space
-            base_preds_orig = torch.expm1(base_preds)  # expm1(x) = exp(x) - 1
+          # expm1(x) = exp(x) - 1
         else:
             base_preds_orig = base_preds
 
         # Ensure non-negative predictions and reasonable max
-        base_preds_orig = torch.clamp(base_preds_orig, min=0, max=5000)
+        base_preds_orig = torch.clamp(base_preds_orig, min=0, max=500)
 
         # Extract individual predictions
         pred_green = base_preds_orig[:, 0]

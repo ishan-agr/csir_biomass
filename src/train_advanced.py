@@ -253,6 +253,7 @@ class AdvancedTrainer:
     ) -> List[torch.Tensor]:
         """Compute individual task losses."""
         task_losses = []
+        predictions = torch.clamp(predictions, min=-2, max=8)
         for i in range(3):
             task_loss = self.loss_fn(predictions[:, i], targets[:, i])
             task_losses.append(task_loss)
@@ -282,7 +283,9 @@ class AdvancedTrainer:
             images = batch['image'].to(self.device, non_blocking=True)
             metadata = batch['metadata'].to(self.device, non_blocking=True)
             targets = batch['targets'].to(self.device, non_blocking=True)
-
+             # ADD THIS DEBUG LINE (only first batch):
+            if step == 0:
+                print(f"TRAIN targets (log space): min={targets.min().item():.2f}, max={targets.max().item():.2f}")
             if self.config.gpu.channels_last:
                 images = images.to(memory_format=torch.channels_last)
 
@@ -533,6 +536,17 @@ class AdvancedTrainer:
             'weighted_r2': weighted_r2,
             **{f'r2_{k}': v for k, v in per_target.items()}
         }
+        # DEBUG: Print sample predictions vs targets
+        print("\n=== DEBUG R² ===")
+        print(f"Predictions shape: {all_predictions.shape}")
+        print(f"Targets shape: {all_targets.shape}")
+        print(f"Predictions sample [0:3]:\n{all_predictions[:3]}")
+        print(f"Targets sample [0:3]:\n{all_targets[:3]}")
+        print(f"Predictions min/max: {all_predictions.min():.2f} / {all_predictions.max():.2f}")
+        print(f"Targets min/max: {all_targets.min():.2f} / {all_targets.max():.2f}")
+        print(f"Predictions mean per col: {all_predictions.mean(axis=0)}")
+        print(f"Targets mean per col: {all_targets.mean(axis=0)}")
+        print("=================\n")
 
         return metrics, weighted_r2
 
