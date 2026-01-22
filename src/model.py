@@ -119,6 +119,20 @@ class RegressionHead(nn.Module):
 
         self.mlp = nn.Sequential(*layers)
 
+        # Initialize final layer bias to reasonable starting point
+        # This helps the model start in the correct output range
+        # 2.5 ≈ log1p(11), which is near the median of typical biomass values
+        self._init_output_bias()
+
+    def _init_output_bias(self, bias_value: float = 2.5):
+        """Initialize the final layer bias to start predictions in valid range."""
+        # Find the last Linear layer
+        for module in reversed(list(self.mlp.modules())):
+            if isinstance(module, nn.Linear):
+                with torch.no_grad():
+                    module.bias.fill_(bias_value)
+                break
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.mlp(x)
 

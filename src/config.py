@@ -204,7 +204,7 @@ class TrainingConfig:
     stratify_by: str = "State"  # Stratify splits by State
 
     # Early stopping
-    patience: int = 10
+    patience: int = 15
     min_delta: float = 1e-4
 
     # Checkpointing
