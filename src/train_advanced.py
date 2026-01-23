@@ -124,6 +124,9 @@ class AdvancedTrainer:
         self.logger.info("Creating dataloaders...")
         self.train_loader, self.val_loader, self.test_loader = get_dataloaders(config, fold)
 
+        # DIAGNOSTIC: Compute target distribution statistics
+        self._log_target_statistics()
+
         # Create model
         self.logger.info(f"Creating model with backbone: {config.model.backbone}")
         self.model = create_model(config)
@@ -208,6 +211,30 @@ class AdvancedTrainer:
         self.best_epoch = 0
         self.global_step = 0
 
+    def _log_target_statistics(self):
+        """Log target distribution statistics for debugging."""
+        # Collect targets from training set
+        all_targets = []
+        for batch in self.train_loader:
+            if 'targets' in batch:
+                all_targets.append(batch['targets'].numpy())
+            if len(all_targets) > 10:  # Sample first 10 batches
+                break
+
+        if all_targets:
+            targets = np.concatenate(all_targets, axis=0)
+            self.logger.info("=" * 60)
+            self.logger.info("TARGET DISTRIBUTION (log space, from training data)")
+            self.logger.info("=" * 60)
+            for i, name in enumerate(['Green', 'Dead', 'Clover']):
+                col = targets[:, i]
+                self.logger.info(
+                    f"  {name}: min={col.min():.2f}, max={col.max():.2f}, "
+                    f"mean={col.mean():.2f}, median={np.median(col):.2f}"
+                )
+            self.logger.info(f"  Overall mean (recommended bias init): {targets.mean():.2f}")
+            self.logger.info("=" * 60)
+
     def _setup_gradient_optimizer(self):
         """Setup the gradient balancing optimizer."""
         method = self.config.gradient_balancing.method.lower()
@@ -266,45 +293,25 @@ class AdvancedTrainer:
             self.uses_manual_grads = False
             self.logger.info("Using standard loss weighting")
 
-    def _soft_clamp(
-        self,
-        x: torch.Tensor,
-        min_val: float = -2.0,
-        max_val: float = 8.0
-    ) -> torch.Tensor:
-        """
-        Soft clamp that preserves gradients everywhere.
-
-        CRITICAL: torch.clamp has ZERO gradient outside its range!
-        When model outputs are extreme (e.g., -18 to +18) but get clamped,
-        the model can't learn because gradients are zero.
-
-        This soft clamp uses a smooth tanh-based transformation:
-        - Maps x to (min_val, max_val) smoothly
-        - Always has non-zero gradient
-        - Steeper near the boundaries
-        """
-        range_size = max_val - min_val
-        center = (max_val + min_val) / 2
-
-        # Normalize to [-1, 1] range, apply tanh, denormalize
-        normalized = (x - center) / (range_size / 2)
-        # Use a scaled tanh that is nearly linear in valid range
-        # but smoothly saturates outside
-        soft = torch.tanh(normalized * 0.5) * 1.2  # Slight stretch for linearity in center
-        return center + soft * (range_size / 2)
-
     def _compute_task_losses(
         self,
         predictions: torch.Tensor,
         targets: torch.Tensor
     ) -> List[torch.Tensor]:
-        """Compute individual task losses."""
+        """
+        Compute individual task losses.
+
+        NO CLAMPING during training!
+
+        Key insight from MTL research (LibMTL, Kendall et al., official MGDA):
+        - None of them clamp predictions during training
+        - The loss function (Huber/MSE) naturally handles outliers
+        - Clamping distorts the loss landscape and blocks gradients
+
+        The previous soft_clamp was compressing valid range [0, 4.3] to [0.96, 3.44],
+        destroying the prediction-target relationship!
+        """
         task_losses = []
-        # Use soft clamp to preserve gradients (critical fix!)
-        # Hard clamp (torch.clamp) has zero gradient outside range, blocking learning
-        # Use same range as inference: [-1, 5.5] (log space, matches expm1 clamp)
-        predictions = self._soft_clamp(predictions, min_val=-1.0, max_val=5.5)
         for i in range(3):
             task_loss = self.loss_fn(predictions[:, i], targets[:, i])
             task_losses.append(task_loss)
@@ -334,9 +341,12 @@ class AdvancedTrainer:
             images = batch['image'].to(self.device, non_blocking=True)
             metadata = batch['metadata'].to(self.device, non_blocking=True)
             targets = batch['targets'].to(self.device, non_blocking=True)
-             # ADD THIS DEBUG LINE (only first batch):
-            if step == 0:
-                print(f"TRAIN targets (log space): min={targets.min().item():.2f}, max={targets.max().item():.2f}")
+            # DEBUG: Print stats on first batch of first epoch
+            if step == 0 and epoch == 1:
+                print(f"\n{'='*60}")
+                print("EPOCH 1, BATCH 1 - INITIAL DIAGNOSTICS")
+                print(f"{'='*60}")
+                print(f"Targets (log space): min={targets.min().item():.3f}, max={targets.max().item():.3f}, mean={targets.mean().item():.3f}")
             if self.config.gpu.channels_last:
                 images = images.to(memory_format=torch.channels_last)
 
@@ -347,6 +357,13 @@ class AdvancedTrainer:
             with autocast(enabled=self.use_amp):
                 output = self.model(images, metadata)
                 predictions = output['base_preds']
+
+            # DEBUG: Print prediction stats on first batch of first epoch
+            if step == 0 and epoch == 1:
+                print(f"Predictions (log space): min={predictions.min().item():.3f}, max={predictions.max().item():.3f}, mean={predictions.mean().item():.3f}")
+                print(f"Per-target means - Pred: [{predictions[:, 0].mean().item():.2f}, {predictions[:, 1].mean().item():.2f}, {predictions[:, 2].mean().item():.2f}]")
+                print(f"Per-target means - Targ: [{targets[:, 0].mean().item():.2f}, {targets[:, 1].mean().item():.2f}, {targets[:, 2].mean().item():.2f}]")
+                print(f"{'='*60}\n")
 
             # Compute per-task losses (outside autocast for gradient computation)
             # Convert to float32 for stable gradient computation

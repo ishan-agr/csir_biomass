@@ -196,6 +196,11 @@ class BiomassModel(nn.Module):
         # Initialize heads
         self._init_weights()
 
+        # IMPORTANT: Re-initialize output layer biases AFTER _init_weights
+        # _init_weights resets all biases to 0, but we want the output layers
+        # to start in the valid log-space range (~2.5 = log1p(11))
+        self._init_output_biases()
+
     def _create_backbone(self, model_cfg: ModelConfig) -> nn.Module:
         """Create pretrained backbone using timm."""
         backbone = timm.create_model(
@@ -217,6 +222,24 @@ class BiomassModel(nn.Module):
                 elif isinstance(m, nn.BatchNorm1d):
                     nn.init.constant_(m.weight, 1)
                     nn.init.constant_(m.bias, 0)
+
+    def _init_output_biases(self, bias_value: float = 2.5):
+        """
+        Initialize output layer biases to valid log-space range.
+
+        This is called AFTER _init_weights to override the zero initialization.
+        2.5 ≈ log1p(11), which is near the median of typical biomass values.
+
+        Without this, the model starts with bias=0, which predicts exp(0)-1=0
+        for all outputs, far from the actual target distribution.
+        """
+        for head in [self.head_green, self.head_dead, self.head_clover]:
+            # Find the last Linear layer in each head
+            for module in reversed(list(head.mlp.modules())):
+                if isinstance(module, nn.Linear):
+                    with torch.no_grad():
+                        module.bias.fill_(bias_value)
+                    break
 
     def forward(
         self,
