@@ -634,17 +634,117 @@ class DWAOptimizer:
         return weights, info
 
 
+class UncertaintyWeighting(nn.Module):
+    """
+    Uncertainty Weighting for Multi-Task Learning.
+
+    Implements homoscedastic uncertainty weighting from:
+    "Multi-Task Learning Using Uncertainty to Weigh Losses for Scene Geometry and Semantics"
+    Kendall et al., CVPR 2018
+    https://arxiv.org/abs/1705.07115
+
+    The loss for task i is weighted by learned uncertainty σ_i:
+        L_total = Σ (1/(2σ_i²)) * L_i + log(σ_i)
+
+    We learn log(σ²) for numerical stability, so:
+        L_total = Σ (1/2) * exp(-log_var_i) * L_i + (1/2) * log_var_i
+
+    This automatically balances tasks - tasks with high uncertainty get lower weight.
+    """
+
+    def __init__(self, n_tasks: int, init_log_var: float = 0.0):
+        """
+        Args:
+            n_tasks: Number of tasks
+            init_log_var: Initial value for log(σ²).
+                          0.0 means σ=1, all tasks weighted equally at start.
+        """
+        super().__init__()
+        self.n_tasks = n_tasks
+
+        # Learnable log-variance per task: log(σ²)
+        # Initialized to init_log_var (0 means σ=1)
+        self.log_vars = nn.Parameter(torch.full((n_tasks,), init_log_var))
+
+        self.step_count = 0
+
+    def forward(
+        self,
+        task_losses: List[torch.Tensor]
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Compute uncertainty-weighted total loss.
+
+        Args:
+            task_losses: List of scalar loss tensors (one per task)
+
+        Returns:
+            total_loss: Weighted sum of losses with regularization
+            info: Dictionary with weights and uncertainties
+        """
+        self.step_count += 1
+
+        losses = torch.stack(task_losses)
+
+        # Precision = 1/σ² = exp(-log_var)
+        precisions = torch.exp(-self.log_vars)
+
+        # Weighted loss: (1/2σ²) * L_i = 0.5 * precision * L_i
+        weighted_losses = 0.5 * precisions * losses
+
+        # Regularization: log(σ) = 0.5 * log(σ²) = 0.5 * log_var
+        regularization = 0.5 * self.log_vars.sum()
+
+        # Total loss
+        total_loss = weighted_losses.sum() + regularization
+
+        # Compute effective weights for logging (normalized precision)
+        with torch.no_grad():
+            effective_weights = precisions / precisions.sum()
+            sigmas = torch.exp(0.5 * self.log_vars)  # σ = exp(0.5 * log_var)
+
+        info = {
+            'uncertainty_total_loss': total_loss.item(),
+            **{f'weight_task{i}': float(effective_weights[i]) for i in range(self.n_tasks)},
+            **{f'sigma_task{i}': float(sigmas[i]) for i in range(self.n_tasks)},
+            **{f'log_var_task{i}': float(self.log_vars[i]) for i in range(self.n_tasks)}
+        }
+
+        return total_loss, info
+
+    def get_weights(self) -> torch.Tensor:
+        """Get current normalized weights (precision / sum)."""
+        precisions = torch.exp(-self.log_vars)
+        return precisions / precisions.sum()
+
+    def get_sigmas(self) -> torch.Tensor:
+        """Get current uncertainty values σ."""
+        return torch.exp(0.5 * self.log_vars)
+
+    def state_dict_custom(self) -> Dict:
+        """Save state for checkpointing."""
+        return {
+            'log_vars': self.log_vars.data.clone(),
+            'step_count': self.step_count
+        }
+
+    def load_state_dict_custom(self, state: Dict):
+        """Load state from checkpoint."""
+        self.log_vars.data = state['log_vars']
+        self.step_count = state['step_count']
+
+
 def create_gradient_optimizer(
     method: str,
     shared_params: List[nn.Parameter],
     n_tasks: int = 3,
     **kwargs
-) -> Union[MGDAOptimizer, GradNormOptimizer, PCGradOptimizer, DWAOptimizer]:
+) -> Union[MGDAOptimizer, GradNormOptimizer, PCGradOptimizer, DWAOptimizer, UncertaintyWeighting]:
     """
     Factory function to create gradient optimizer.
 
     Args:
-        method: 'mgda', 'gradnorm', 'pcgrad', 'dwa'
+        method: 'mgda', 'gradnorm', 'pcgrad', 'dwa', 'uncertainty'
         shared_params: List of shared parameters
         n_tasks: Number of tasks
         **kwargs: Method-specific arguments
@@ -669,6 +769,11 @@ def create_gradient_optimizer(
         return DWAOptimizer(
             n_tasks=n_tasks,
             temperature=kwargs.get('temperature', 2.0)
+        )
+    elif method == 'uncertainty':
+        return UncertaintyWeighting(
+            n_tasks=n_tasks,
+            init_log_var=kwargs.get('init_log_var', 0.0)
         )
     else:
         raise ValueError(f"Unknown method: {method}")

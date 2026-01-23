@@ -34,7 +34,7 @@ from dataset import get_dataloaders, MixupCutmix
 from model import BiomassModel, MultiTaskLoss, create_model
 from gradient_balancing import (
     MGDAOptimizer, GradNormOptimizer, PCGradOptimizer, DWAOptimizer,
-    create_gradient_optimizer
+    UncertaintyWeighting, create_gradient_optimizer
 )
 from utils import (
     set_seed,
@@ -150,6 +150,18 @@ class AdvancedTrainer:
 
         # Main optimizer for all parameters
         param_groups = self.model.get_param_groups(config)
+
+        # Add UncertaintyWeighting parameters to optimizer if using uncertainty method
+        if isinstance(self.grad_optimizer, UncertaintyWeighting):
+            # Move uncertainty module to device
+            self.grad_optimizer = self.grad_optimizer.to(self.device)
+            # Add its parameters with a separate learning rate
+            param_groups.append({
+                'params': list(self.grad_optimizer.parameters()),
+                'lr': config.training.learning_rate,  # Same LR as main model
+                'weight_decay': 0.0  # No weight decay on log_vars
+            })
+
         self.optimizer = torch.optim.AdamW(
             param_groups,
             lr=config.training.learning_rate,
@@ -240,11 +252,47 @@ class AdvancedTrainer:
             )
             self.logger.info("Using Dynamic Weight Averaging")
 
+        elif method == 'uncertainty':
+            self.grad_optimizer = UncertaintyWeighting(
+                n_tasks=3,
+                init_log_var=0.0  # Start with equal weights (σ=1)
+            )
+            self.logger.info("Using Uncertainty Weighting (Kendall et al.)")
+            self.logger.info("  L = Σ (1/2σ²) * L_i + log(σ_i)")
+
         else:
             # Fallback to standard weighted loss
             self.grad_optimizer = None
             self.uses_manual_grads = False
             self.logger.info("Using standard loss weighting")
+
+    def _soft_clamp(
+        self,
+        x: torch.Tensor,
+        min_val: float = -2.0,
+        max_val: float = 8.0
+    ) -> torch.Tensor:
+        """
+        Soft clamp that preserves gradients everywhere.
+
+        CRITICAL: torch.clamp has ZERO gradient outside its range!
+        When model outputs are extreme (e.g., -18 to +18) but get clamped,
+        the model can't learn because gradients are zero.
+
+        This soft clamp uses a smooth tanh-based transformation:
+        - Maps x to (min_val, max_val) smoothly
+        - Always has non-zero gradient
+        - Steeper near the boundaries
+        """
+        range_size = max_val - min_val
+        center = (max_val + min_val) / 2
+
+        # Normalize to [-1, 1] range, apply tanh, denormalize
+        normalized = (x - center) / (range_size / 2)
+        # Use a scaled tanh that is nearly linear in valid range
+        # but smoothly saturates outside
+        soft = torch.tanh(normalized * 0.5) * 1.2  # Slight stretch for linearity in center
+        return center + soft * (range_size / 2)
 
     def _compute_task_losses(
         self,
@@ -253,7 +301,10 @@ class AdvancedTrainer:
     ) -> List[torch.Tensor]:
         """Compute individual task losses."""
         task_losses = []
-        predictions = torch.clamp(predictions, min=-2, max=8)
+        # Use soft clamp to preserve gradients (critical fix!)
+        # Hard clamp (torch.clamp) has zero gradient outside range, blocking learning
+        # Use same range as inference: [-1, 5.5] (log space, matches expm1 clamp)
+        predictions = self._soft_clamp(predictions, min_val=-1.0, max_val=5.5)
         for i in range(3):
             task_loss = self.loss_fn(predictions[:, i], targets[:, i])
             task_losses.append(task_loss)
@@ -423,6 +474,14 @@ class AdvancedTrainer:
                     loss_a = sum(w * l for w, l in zip(weights, task_losses_a))
                     loss_b = sum(w * l for w, l in zip(weights, task_losses_b))
                     loss = lam * loss_a + (1 - lam) * loss_b
+
+                elif isinstance(self.grad_optimizer, UncertaintyWeighting):
+                    # Uncertainty weighting: learns task-specific uncertainty σ
+                    # L = Σ (1/2σ²) * L_i + log(σ_i)
+                    loss_a, info_a = self.grad_optimizer(task_losses_a)
+                    loss_b, info_b = self.grad_optimizer(task_losses_b)
+                    loss = lam * loss_a + (1 - lam) * loss_b
+                    info = info_a
 
                 else:
                     # Standard equal weighting
@@ -618,6 +677,14 @@ class AdvancedTrainer:
                 if 'n_conflicts' in train_metrics:
                     self.logger.info(f"  PCGrad conflicts: {train_metrics['n_conflicts']:.1f}")
 
+                # Log uncertainty weighting info (σ values)
+                if 'sigma_task0' in train_metrics:
+                    sigma_info = " | ".join([
+                        f"σ{i}: {train_metrics.get(f'sigma_task{i}', 1.0):.3f}"
+                        for i in range(3)
+                    ])
+                    self.logger.info(f"  Uncertainty σ: {sigma_info}")
+
                 # Save best model
                 if val_score > self.best_score:
                     self.best_score = val_score
@@ -726,7 +793,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Advanced Training with Proper MGDA")
     parser.add_argument('--backbone', type=str, default='convnext_base')
     parser.add_argument('--gradient_method', type=str, default='mgda',
-                        choices=['equal', 'competition', 'mgda', 'gradnorm', 'pcgrad', 'dwa'])
+                        choices=['equal', 'competition', 'mgda', 'gradnorm', 'pcgrad', 'dwa', 'uncertainty'])
     parser.add_argument('--fold', type=int, default=None)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=16)
