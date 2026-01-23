@@ -89,9 +89,16 @@ class MetadataEncoder(nn.Module):
 
 class RegressionHead(nn.Module):
     """
-    Task-specific regression head.
+    Task-specific regression head with BOUNDED OUTPUT.
 
     Architecture: MLP with residual connections and dropout.
+
+    CRITICAL: Uses sigmoid activation to constrain output to valid range.
+    This prevents extreme outputs that cause negative R² scores.
+
+    For log-space targets (log1p transform):
+    - Valid range: approximately [-1, 5.5] (covers 0 to ~244 in original space)
+    - Sigmoid maps raw output to [0, 1], then scaled to target range
     """
 
     def __init__(
@@ -99,9 +106,15 @@ class RegressionHead(nn.Module):
         input_dim: int,
         hidden_dims: List[int],
         output_dim: int = 1,
-        dropout: float = 0.2
+        dropout: float = 0.2,
+        output_min: float = -0.5,  # Slightly below 0 for log space
+        output_max: float = 5.0    # log1p(~148) - reasonable upper bound
     ):
         super().__init__()
+
+        self.output_min = output_min
+        self.output_max = output_max
+        self.output_range = output_max - output_min
 
         layers = []
         prev_dim = input_dim
@@ -119,22 +132,20 @@ class RegressionHead(nn.Module):
 
         self.mlp = nn.Sequential(*layers)
 
-        # Initialize final layer bias to reasonable starting point
-        # This helps the model start in the correct output range
-        # 2.5 ≈ log1p(11), which is near the median of typical biomass values
-        self._init_output_bias()
-
-    def _init_output_bias(self, bias_value: float = 2.5):
-        """Initialize the final layer bias to start predictions in valid range."""
-        # Find the last Linear layer
-        for module in reversed(list(self.mlp.modules())):
-            if isinstance(module, nn.Linear):
-                with torch.no_grad():
-                    module.bias.fill_(bias_value)
-                break
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.mlp(x)
+        """
+        Forward pass with bounded output.
+
+        Uses sigmoid to ensure output is ALWAYS in [output_min, output_max].
+        This guarantees:
+        1. No extreme predictions
+        2. Gradients always flow (sigmoid never has zero gradient)
+        3. Consistent behavior in training and inference
+        """
+        raw = self.mlp(x)
+        # Sigmoid maps to [0, 1], then scale to [output_min, output_max]
+        bounded = torch.sigmoid(raw) * self.output_range + self.output_min
+        return bounded
 
 
 class BiomassModel(nn.Module):
@@ -195,11 +206,8 @@ class BiomassModel(nn.Module):
 
         # Initialize heads
         self._init_weights()
-
-        # IMPORTANT: Re-initialize output layer biases AFTER _init_weights
-        # _init_weights resets all biases to 0, but we want the output layers
-        # to start in the valid log-space range (~2.5 = log1p(11))
-        self._init_output_biases()
+        # Note: No special bias init needed - sigmoid activation naturally
+        # centers outputs in the valid range
 
     def _create_backbone(self, model_cfg: ModelConfig) -> nn.Module:
         """Create pretrained backbone using timm."""
@@ -222,24 +230,6 @@ class BiomassModel(nn.Module):
                 elif isinstance(m, nn.BatchNorm1d):
                     nn.init.constant_(m.weight, 1)
                     nn.init.constant_(m.bias, 0)
-
-    def _init_output_biases(self, bias_value: float = 2.5):
-        """
-        Initialize output layer biases to valid log-space range.
-
-        This is called AFTER _init_weights to override the zero initialization.
-        2.5 ≈ log1p(11), which is near the median of typical biomass values.
-
-        Without this, the model starts with bias=0, which predicts exp(0)-1=0
-        for all outputs, far from the actual target distribution.
-        """
-        for head in [self.head_green, self.head_dead, self.head_clover]:
-            # Find the last Linear layer in each head
-            for module in reversed(list(head.mlp.modules())):
-                if isinstance(module, nn.Linear):
-                    with torch.no_grad():
-                        module.bias.fill_(bias_value)
-                    break
 
     def forward(
         self,
@@ -321,22 +311,17 @@ class BiomassModel(nn.Module):
             (batch, 5) predictions [Dry_Green_g, Dry_Dead_g, Dry_Clover_g, GDM_g, Dry_Total_g]
         """
         output = self.forward(images, metadata)
-        base_preds = output['base_preds']  # (batch, 3) in log space
-        if not self.training:
-            print(f"DEBUG base_preds (log space): min={base_preds.min().item():.2f}, max={base_preds.max().item():.2f}, mean={base_preds.mean().item():.2f}")
-        print(f"RAW base_preds: min={base_preds.min().item():.2f}, max={base_preds.max().item():.2f}")
+        base_preds = output['base_preds']  # (batch, 3) - bounded by sigmoid to [-0.5, 5.0]
+
         if use_log_transform:
-            # Clamp predictions BEFORE expm1 to prevent explosion
-            # log1p(1000) ≈ 6.9, so clamp to reasonable range
-            base_preds = torch.clamp(base_preds, min=-1, max=5.5)
+            # Convert from log space to original space: expm1(x) = exp(x) - 1
+            # With sigmoid-bounded outputs in [-0.5, 5.0], expm1 gives [-0.39, 147.4]
             base_preds_orig = torch.expm1(base_preds)
-            # Convert from log space to original space
-          # expm1(x) = exp(x) - 1
         else:
             base_preds_orig = base_preds
 
-        # Ensure non-negative predictions and reasonable max
-        base_preds_orig = torch.clamp(base_preds_orig, min=0, max=500)
+        # Ensure non-negative (expm1 of negative values is negative)
+        base_preds_orig = torch.clamp(base_preds_orig, min=0)
 
         # Extract individual predictions
         pred_green = base_preds_orig[:, 0]

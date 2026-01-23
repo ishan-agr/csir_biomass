@@ -298,19 +298,7 @@ class AdvancedTrainer:
         predictions: torch.Tensor,
         targets: torch.Tensor
     ) -> List[torch.Tensor]:
-        """
-        Compute individual task losses.
-
-        NO CLAMPING during training!
-
-        Key insight from MTL research (LibMTL, Kendall et al., official MGDA):
-        - None of them clamp predictions during training
-        - The loss function (Huber/MSE) naturally handles outliers
-        - Clamping distorts the loss landscape and blocks gradients
-
-        The previous soft_clamp was compressing valid range [0, 4.3] to [0.96, 3.44],
-        destroying the prediction-target relationship!
-        """
+        """Compute individual task losses."""
         task_losses = []
         for i in range(3):
             task_loss = self.loss_fn(predictions[:, i], targets[:, i])
