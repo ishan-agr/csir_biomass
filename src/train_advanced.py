@@ -215,24 +215,38 @@ class AdvancedTrainer:
         """Log target distribution statistics for debugging."""
         # Collect targets from training set
         all_targets = []
+        all_raw_targets = []
         for batch in self.train_loader:
             if 'targets' in batch:
                 all_targets.append(batch['targets'].numpy())
+            if 'raw_targets' in batch:
+                all_raw_targets.append(batch['raw_targets'].numpy())
             if len(all_targets) > 10:  # Sample first 10 batches
                 break
 
         if all_targets:
             targets = np.concatenate(all_targets, axis=0)
+            use_log = self.config.training.use_log_transform
+            target_scale = getattr(self.config.training, 'target_scale', 100.0)
+
             self.logger.info("=" * 60)
-            self.logger.info("TARGET DISTRIBUTION (log space, from training data)")
+            if use_log:
+                self.logger.info("TARGET DISTRIBUTION (log space - LEGACY)")
+            else:
+                self.logger.info(f"TARGET DISTRIBUTION (scaled by /{target_scale})")
             self.logger.info("=" * 60)
             for i, name in enumerate(['Green', 'Dead', 'Clover']):
                 col = targets[:, i]
                 self.logger.info(
-                    f"  {name}: min={col.min():.2f}, max={col.max():.2f}, "
-                    f"mean={col.mean():.2f}, median={np.median(col):.2f}"
+                    f"  {name}: min={col.min():.3f}, max={col.max():.3f}, "
+                    f"mean={col.mean():.3f}, median={np.median(col):.3f}"
                 )
-            self.logger.info(f"  Overall mean (recommended bias init): {targets.mean():.2f}")
+            self.logger.info(f"  Overall mean: {targets.mean():.3f}")
+
+            # Also log raw targets for reference
+            if all_raw_targets:
+                raw = np.concatenate(all_raw_targets, axis=0)
+                self.logger.info(f"  Raw targets (grams) - mean: {raw[:, :3].mean():.2f}, max: {raw[:, :3].max():.2f}")
             self.logger.info("=" * 60)
 
     def _setup_gradient_optimizer(self):
@@ -577,9 +591,12 @@ class AdvancedTrainer:
                 images = images.to(memory_format=torch.channels_last)
 
             with autocast(enabled=self.use_amp):
+                # Get target_scale from config (default 100.0)
+                target_scale = getattr(self.config.training, 'target_scale', 100.0)
                 predictions = self.model.predict_all_targets(
                     images, metadata,
-                    use_log_transform=self.config.training.use_log_transform
+                    use_log_transform=self.config.training.use_log_transform,
+                    target_scale=target_scale
                 )
 
             all_predictions.append(predictions.cpu().numpy())

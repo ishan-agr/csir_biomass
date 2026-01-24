@@ -189,11 +189,16 @@ class TrainingConfig:
     min_lr: float = 1e-6
 
     # Loss function
-    loss_type: str = "huber"  # Options: mse, huber, smooth_l1
+    loss_type: str = "mse"  # Options: mse, huber, smooth_l1 (MSE works best with scaling)
     huber_delta: float = 1.0
 
     # Target transformation
-    use_log_transform: bool = True  # log1p(target) for training
+    # IMPORTANT: Based on research, log transform should only be applied during
+    # R² evaluation, NOT during training. The working solution (0.72 R²) uses
+    # simple scaling instead of log transform during training.
+    # Reference: CSIRO paper states log transform is for "computing R² values"
+    use_log_transform: bool = False  # DISABLED - use target_scale instead
+    target_scale: float = 100.0  # Divide targets by this value for training (normalize to ~0-1)
 
     # Loss weighting strategy (legacy - use gradient_balancing.method instead)
     loss_weighting: str = "competition"  # Options: equal, competition, uncertainty

@@ -36,10 +36,17 @@ TARGET_ORDER = ["Dry_Green_g", "Dry_Dead_g", "Dry_Clover_g", "GDM_g", "Dry_Total
 def weighted_r2_score(
     y_true: np.ndarray,
     y_pred: np.ndarray,
-    target_names: Optional[List[str]] = None
+    target_names: Optional[List[str]] = None,
+    use_log_transform: bool = True
 ) -> float:
     """
     Compute weighted R² score as per competition rules.
+
+    IMPORTANT: Based on the CSIRO paper, log-stabilizing transformation is applied
+    to all target variables BEFORE computing R² values:
+        y_trans = log(1 + y)
+
+    This is the competition metric - log transform is for EVALUATION, not training.
 
     The weighted R² is computed globally over all (image, target) pairs,
     with per-row weights based on target type.
@@ -47,15 +54,15 @@ def weighted_r2_score(
     Formula:
         R² = 1 - SS_res / SS_tot
 
-    where:
-        SS_res = sum(w_i * (y_i - y_hat_i)²)
-        SS_tot = sum(w_i * (y_i - y_bar_weighted)²)
-        y_bar_weighted = sum(w_i * y_i) / sum(w_i)
+    where (after log transform):
+        SS_res = sum(w_i * (log(1+y_i) - log(1+y_hat_i))²)
+        SS_tot = sum(w_i * (log(1+y_i) - log(1+y_bar_weighted))²)
 
     Args:
-        y_true: (n_samples, 5) or (n_samples * 5,) ground truth values
-        y_pred: (n_samples, 5) or (n_samples * 5,) predicted values
+        y_true: (n_samples, 5) or (n_samples * 5,) ground truth values (in grams)
+        y_pred: (n_samples, 5) or (n_samples * 5,) predicted values (in grams)
         target_names: List of target names in order (if flattened)
+        use_log_transform: Whether to apply log1p before computing R² (default: True)
 
     Returns:
         Weighted R² score
@@ -63,6 +70,15 @@ def weighted_r2_score(
     # Ensure numpy arrays
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
+
+    # Apply log transform for competition metric (as per CSIRO paper)
+    if use_log_transform:
+        # Ensure non-negative before log
+        y_true = np.maximum(y_true, 0)
+        y_pred = np.maximum(y_pred, 0)
+        # Apply log1p: log(1 + y)
+        y_true = np.log1p(y_true)
+        y_pred = np.log1p(y_pred)
 
     # Handle different input shapes
     if y_true.ndim == 2:
@@ -117,19 +133,28 @@ def weighted_r2_score(
 
 def per_target_r2(
     y_true: np.ndarray,
-    y_pred: np.ndarray
+    y_pred: np.ndarray,
+    use_log_transform: bool = True
 ) -> Dict[str, float]:
     """
     Compute R² for each target separately.
 
     Args:
-        y_true: (n_samples, 5) ground truth
-        y_pred: (n_samples, 5) predictions
+        y_true: (n_samples, 5) ground truth (in grams)
+        y_pred: (n_samples, 5) predictions (in grams)
+        use_log_transform: Whether to apply log1p before computing R² (default: True)
 
     Returns:
         Dictionary with R² for each target
     """
     from sklearn.metrics import r2_score
+
+    # Apply log transform for competition metric (as per CSIRO paper)
+    if use_log_transform:
+        y_true = np.maximum(y_true, 0)
+        y_pred = np.maximum(y_pred, 0)
+        y_true = np.log1p(y_true)
+        y_pred = np.log1p(y_pred)
 
     r2_scores = {}
     for i, target in enumerate(TARGET_ORDER):

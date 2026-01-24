@@ -89,16 +89,19 @@ class MetadataEncoder(nn.Module):
 
 class RegressionHead(nn.Module):
     """
-    Task-specific regression head with BOUNDED OUTPUT.
+    Task-specific regression head with SOFTPLUS OUTPUT.
 
-    Architecture: MLP with residual connections and dropout.
+    Architecture: MLP with dropout.
 
-    CRITICAL: Uses sigmoid activation to constrain output to valid range.
-    This prevents extreme outputs that cause negative R² scores.
+    Uses Softplus activation to ensure non-negative outputs without
+    the saturation issues of sigmoid. This is the approach used by
+    the working solution achieving 0.72 R².
 
-    For log-space targets (log1p transform):
-    - Valid range: approximately [-1, 5.5] (covers 0 to ~244 in original space)
-    - Sigmoid maps raw output to [0, 1], then scaled to target range
+    Softplus: f(x) = log(1 + exp(x))
+    - Always positive (biomass can't be negative)
+    - No upper bound (unlike sigmoid)
+    - No saturation/gradient vanishing at extremes
+    - Smooth approximation to ReLU
     """
 
     def __init__(
@@ -106,15 +109,9 @@ class RegressionHead(nn.Module):
         input_dim: int,
         hidden_dims: List[int],
         output_dim: int = 1,
-        dropout: float = 0.2,
-        output_min: float = -0.5,  # Slightly below 0 for log space
-        output_max: float = 5.0    # log1p(~148) - reasonable upper bound
+        dropout: float = 0.2
     ):
         super().__init__()
-
-        self.output_min = output_min
-        self.output_max = output_max
-        self.output_range = output_max - output_min
 
         layers = []
         prev_dim = input_dim
@@ -131,21 +128,20 @@ class RegressionHead(nn.Module):
         layers.append(nn.Linear(prev_dim, output_dim))
 
         self.mlp = nn.Sequential(*layers)
+        self.softplus = nn.Softplus()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass with bounded output.
+        Forward pass with softplus output.
 
-        Uses sigmoid to ensure output is ALWAYS in [output_min, output_max].
-        This guarantees:
-        1. No extreme predictions
-        2. Gradients always flow (sigmoid never has zero gradient)
-        3. Consistent behavior in training and inference
+        Softplus ensures:
+        1. Non-negative outputs (biomass >= 0)
+        2. No gradient saturation (unlike sigmoid)
+        3. Unbounded output (can learn any positive value)
         """
         raw = self.mlp(x)
-        # Sigmoid maps to [0, 1], then scale to [output_min, output_max]
-        bounded = torch.sigmoid(raw) * self.output_range + self.output_min
-        return bounded
+        # Softplus ensures non-negative output
+        return self.softplus(raw)
 
 
 class BiomassModel(nn.Module):
@@ -291,37 +287,40 @@ class BiomassModel(nn.Module):
         self,
         images: torch.Tensor,
         metadata: torch.Tensor,
-        use_log_transform: bool = True
+        use_log_transform: bool = False,
+        target_scale: float = 100.0
     ) -> torch.Tensor:
         """
         Predict all 5 targets for inference.
 
         This method:
-        1. Gets base predictions (in log space if log transform used)
-        2. Converts to original space
+        1. Gets base predictions (scaled if target scaling used, or log space if legacy)
+        2. Converts to original space (grams)
         3. Computes derived targets
         4. Returns all 5 predictions
 
         Args:
             images: (batch, 3, H, W)
             metadata: (batch, 4)
-            use_log_transform: Whether model was trained with log transform
+            use_log_transform: Whether model was trained with log transform (legacy, NOT recommended)
+            target_scale: Scale factor used during training (default 100.0)
 
         Returns:
             (batch, 5) predictions [Dry_Green_g, Dry_Dead_g, Dry_Clover_g, GDM_g, Dry_Total_g]
         """
         output = self.forward(images, metadata)
-        base_preds = output['base_preds']  # (batch, 3) - bounded by sigmoid to [-0.5, 5.0]
+        base_preds = output['base_preds']  # (batch, 3) - softplus ensures non-negative
 
         if use_log_transform:
-            # Convert from log space to original space: expm1(x) = exp(x) - 1
-            # With sigmoid-bounded outputs in [-0.5, 5.0], expm1 gives [-0.39, 147.4]
+            # Legacy: Convert from log space to original space
             base_preds_orig = torch.expm1(base_preds)
+            base_preds_orig = torch.clamp(base_preds_orig, min=0)
         else:
-            base_preds_orig = base_preds
-
-        # Ensure non-negative (expm1 of negative values is negative)
-        base_preds_orig = torch.clamp(base_preds_orig, min=0)
+            # Recommended: Convert from scaled space to original space (grams)
+            # Model predicts in [0, ~1] range (due to /100 scaling), multiply back
+            base_preds_orig = base_preds * target_scale
+            # Softplus already ensures non-negative, but clamp for safety
+            base_preds_orig = torch.clamp(base_preds_orig, min=0)
 
         # Extract individual predictions
         pred_green = base_preds_orig[:, 0]

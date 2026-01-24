@@ -4,9 +4,14 @@ Dataset and DataLoader for CSIRO Pasture Biomass Prediction.
 Features:
 - Efficient image loading with caching
 - Metadata integration (NDVI, Height, State, Species)
-- Target transformation (log1p)
+- Target scaling (divide by target_scale, NOT log1p)
 - Comprehensive augmentation pipeline
 - Stratified K-Fold splitting
+
+NOTE: Based on research, log1p transform should only be applied during
+R² evaluation, not during training. The working solution (0.72 R²) uses
+simple scaling instead. Reference: CSIRO paper states log transform is
+for "computing R² values", not for training targets.
 """
 
 import numpy as np
@@ -125,13 +130,20 @@ class BiomassDataset(Dataset):
         if self.mode != "test":
             targets = self.targets[idx]
 
-            # Apply log transform if configured
+            # Apply target transformation
             if self.config.training.use_log_transform:
+                # Legacy: log1p transform (NOT RECOMMENDED)
                 targets = np.log1p(targets)
+            else:
+                # Recommended: Simple scaling (divide by target_scale)
+                # This normalizes targets to ~0-1 range for stable training
+                # Based on working solution achieving 0.72 R²
+                target_scale = getattr(self.config.training, 'target_scale', 100.0)
+                targets = targets / target_scale
 
             output['targets'] = torch.tensor(targets, dtype=torch.float32)
 
-            # Also include raw targets for evaluation
+            # Also include raw targets for evaluation (always in original scale)
             if hasattr(self, 'all_targets'):
                 output['raw_targets'] = torch.tensor(
                     self.all_targets[idx], dtype=torch.float32
