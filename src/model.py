@@ -207,8 +207,28 @@ class BiomassModel(nn.Module):
 
     def _create_backbone(self, model_cfg: ModelConfig) -> nn.Module:
         """Create pretrained backbone using timm."""
+        # Map user-friendly names to correct timm model names with pretrained weights
+        TIMM_MODEL_NAMES = {
+            # ConvNeXt variants
+            "convnext_base": "convnext_base.fb_in22k_ft_in1k_384",
+            "convnext_large": "convnext_large.fb_in22k_ft_in1k_384",
+            "convnext_tiny": "convnext_tiny.fb_in22k_ft_in1k_384",
+            # EfficientNetV2 variants
+            "efficientnetv2_s": "tf_efficientnetv2_s.in21k_ft_in1k",
+            "efficientnetv2_m": "tf_efficientnetv2_m.in21k_ft_in1k",
+            "efficientnetv2_l": "tf_efficientnetv2_l.in21k_ft_in1k",
+            # Swin variants
+            "swin_base_patch4_window12_384": "swin_base_patch4_window12_384.ms_in22k_ft_in1k",
+            "swin_large_patch4_window12_384": "swin_large_patch4_window12_384.ms_in22k_ft_in1k",
+        }
+
+        # Get correct timm name, fallback to original if not in mapping
+        timm_name = TIMM_MODEL_NAMES.get(model_cfg.backbone, model_cfg.backbone)
+
+        print(f"Loading backbone: {timm_name} (pretrained={model_cfg.pretrained})")
+
         backbone = timm.create_model(
-            model_cfg.backbone,
+            timm_name,
             pretrained=model_cfg.pretrained,
             num_classes=0,  # Remove classification head
             global_pool='avg'  # Global average pooling

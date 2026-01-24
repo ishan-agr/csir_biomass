@@ -70,7 +70,7 @@ class ModelConfig:
     """Model architecture configuration."""
     # Backbone selection
     backbone: str = "convnext_large"  # Options: convnext_base, efficientnetv2_m, swin_base_patch4_window12_384
-    pretrained: bool = True
+    pretrained: bool = True  # CRITICAL: Must be True for pretrained ImageNet weights
 
     # Feature dimensions (will be set based on backbone)
     backbone_dim: int = 1024  # ConvNeXt-Base output dim
